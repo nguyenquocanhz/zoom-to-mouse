@@ -1,5 +1,5 @@
 -- Minimal fake of the `obslua` module so OBS scripts can be loaded and driven by LuaJIT
--- outside of OBS. It only models what the scripts in ../scripts use; any other API name
+-- outside of OBS. It only models what the scripts in this repo use; any other API name
 -- a script touches is recorded in M.unknown so the test runner can flag typos.
 
 local M = {}

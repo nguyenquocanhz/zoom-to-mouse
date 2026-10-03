@@ -16,7 +16,12 @@ function H.load(script)
     local M = require("mock_obs")
     M.install()
     local env = setmetatable({}, { __index = _G })
-    local chunk = assert(loadfile(dir .. "/../" .. script))
+    -- obs-zoom-to-mouse.lua lives at the repo root, every other script in plugins/
+    local path = dir .. "/../plugins/" .. script
+    if script == "obs-zoom-to-mouse.lua" then
+        path = dir .. "/../" .. script
+    end
+    local chunk = assert(loadfile(path))
     setfenv(chunk, env)
     chunk()
     return env, M
