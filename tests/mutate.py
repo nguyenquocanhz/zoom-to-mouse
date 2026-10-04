@@ -22,7 +22,8 @@ Z, C, P, A, R, CH, L, T = (
 CF = "cartoon-face.lua"
 FM = "face-mask.lua"
 SW = "smooth-scene-switcher.lua"
-TEST = {Z: "test_zoom.lua", C: "test_countdown.lua", P: "test_pomodoro.lua", A: "test_afk.lua",
+ZM = "obs-zoom-to-mouse.lua#monitors"  # same script, checked by test_zoom_monitors.lua
+TEST = {Z: "test_zoom.lua", ZM: "test_zoom_monitors.lua", C: "test_countdown.lua", P: "test_pomodoro.lua", A: "test_afk.lua",
         R: "test_replay.lua", CH: "test_chapters.lua", L: "test_live_timer.lua", T: "test_ticker.lua",
         CF: "test_cartoon.lua", FM: "test_mask.lua", SW: "test_switcher.lua"}
 
@@ -135,6 +136,20 @@ MUTANTS = [
     ("replay-event-callback-deadlock", R, "function script_load(settings)\n",
      "function script_load(settings)\n    obs.obs_frontend_add_event_callback(function(e) end)\n"),
     ("replay-poll-no-timeout", R, "elseif now_sec() - save_requested_at > SAVE_TIMEOUT_S then", "elseif false then"),
+    # --- zoom: external monitors (màn hình rời) ---
+    ("zoom-monitor-stale", ZM, "    -- Always re-read: the capture may have been switched to another monitor since last time\n    monitor_info = get_monitor_info(source)",
+     "    if not monitor_info then monitor_info = get_monitor_info(source) end"),
+    ("zoom-resolution-change-ignored", ZM, "if w ~= zoom_info.base_w or h ~= zoom_info.base_h or user_crop", "if false or user_crop"),
+    ("zoom-no-recheck-before-zoom", ZM, "    elseif not use_monitor_override then\n        monitor_info = get_monitor_info(source)\n    end\n    return sceneitem ~= nil",
+     "    end\n    return sceneitem ~= nil"),
+    ("zoom-no-os-monitor-list", ZM, "info, how = pick_monitor(info, get_monitor_rects(), src_w, src_h, ffi.os ~= \"OSX\")", "local how = \"none\""),
+    ("zoom-guess-ambiguous-monitor", ZM, "    if #hits == 1 then", "    if #hits >= 1 then"),
+    ("zoom-mac-trusts-pixel-names", ZM, "if trust_parsed or #rects == 0 then", "if true then"),
+    ("zoom-crop-before-scale", ZM, "    -- Mouse units -> source pixels", "    mouse.x = mouse.x - zoom.source_crop_filter.x * 2\n    -- Mouse units -> source pixels"),
+    ("zoom-calibrate-immediate", ZM, "            obs.timer_add(on_calibrate_timer, CALIBRATE_DELAY_MS)", "            calibrate_monitor()"),
+    ("zoom-calibrate-not-saved", ZM, '                obs.obs_data_set_int(script_settings, "monitor_override_x", monitor_override_x)\n', ""),
+    ("zoom-false-error-at-startup", ZM, "    if source == nil then\n        return\n    end\n\n    -- Always", "    -- Always"),
+    ("zoom-stale-user-crop", ZM, " or user_crop_signature(source) ~= zoom_info.crop_sig then", " then"),
 ]
 
 
@@ -147,7 +162,8 @@ def main():
         with tempfile.TemporaryDirectory() as tmp:
             dst = Path(tmp) / "obs-lua"
             shutil.copytree(ROOT, dst, ignore=shutil.ignore_patterns(".git"))
-            path = dst / script if script == Z else dst / "plugins" / script
+            real = script.split("#")[0]
+            path = dst / real if real == Z else dst / "plugins" / real
             src = path.read_text(encoding="utf-8")
             count = src.count(old)
             if count != 1:
