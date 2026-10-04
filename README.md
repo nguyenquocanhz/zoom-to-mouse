@@ -44,7 +44,7 @@ Chọn script và bấm nút **`−`**. Script nào chỉnh scene hoặc source 
 
 ---
 
-## 2. Zoom to Mouse v1.2.0
+## 2. Zoom to Mouse v1.3.0
 
 Bản fork của [BlankSourceCode/obs-zoom-to-mouse](https://github.com/BlankSourceCode/obs-zoom-to-mouse), bảo trì tại [nguyenquocanhz/zoom-to-mouse](https://github.com/nguyenquocanhz/zoom-to-mouse).
 
@@ -65,13 +65,14 @@ Bản fork của [BlankSourceCode/obs-zoom-to-mouse](https://github.com/BlankSou
 |---|---|---|
 | Zoom Factor | Mức phóng to (1–10×) | 2 cho màn 1080p, 2.5–3 cho màn 4K |
 | Zoom Step (hotkey) | Mỗi lần bấm zoom more/less thay đổi bao nhiêu | 0.5 |
-| Zoom Speed | Tốc độ animation zoom vào/ra | 0.04–0.08 |
-| **Scale filter while zoomed** | Bộ lọc phóng ảnh khi đang zoom | **Lanczos** (nét nhất) |
+| **Zoom mode** | **Smooth** (mặc định): shader dịch khung theo phần lẻ pixel + phóng bicubic, không đụng transform. **Crop**: cách cũ bằng crop filter | Smooth |
+| Zoom Speed | Tốc độ animation zoom vào/ra | 0.04–0.06 |
+| **Scale filter while zoomed** | (Chỉ chế độ Crop) Bộ lọc phóng ảnh khi đang zoom | **Lanczos** (nét nhất) |
 | **Sharpen while zoomed** | Độ làm nét, tăng dần theo mức zoom (0 = tắt) | 0.1–0.2 |
 | Auto zoom on click | Click chuột trái trong vùng màn hình thì tự zoom | Bật cho video hướng dẫn |
 | Auto zoom out after (s) | Không động chuột bao nhiêu giây thì tự zoom ra (0 = không bao giờ) | 2–4 giây |
 | Auto follow mouse | Khung tự bám chuột khi đang zoom | Bật |
-| Follow Speed | Tốc độ khung đuổi theo chuột | 0.15–0.3 |
+| Follow Speed | Độ nhanh của "lò xo" khung đuổi theo chuột (0.18 ≈ 0.17 giây để bắt kịp) | 0.12–0.25 |
 | Follow Border | Chuột vào sát mép bao nhiêu % thì khung bắt đầu chạy theo | 5–15 |
 | Lock Sensitivity | Khung chạy tới gần chuột bao nhiêu px thì đứng yên | 4 |
 | Auto Lock on reverse direction | Kéo chuột ngược lại thì khung dừng (giống kéo camera trong game RTS) | Tùy thích |
@@ -89,6 +90,13 @@ Khi zoom 2× trên màn 1080p, OBS cắt một vùng 960×540 rồi **phóng nó
 4. **Đừng zoom quá tay**: trên màn 1080p, 1.5–2× là hợp lý. Từ 3× trở lên chữ sẽ to nhưng vỡ.
 5. **Đủ bitrate**: lúc khung chạy theo chuột, cả hình thay đổi liên tục. Bitrate thấp thì hình bị nhòe khi chuyển động. Ghi video nên dùng CQP/CRF khoảng 18–20; stream 1080p60 nên từ 6000 Kbps.
 6. Tăng font hệ thống / zoom IDE (Ctrl + `+`) trước khi quay. Đây vẫn là cách rẻ nhất để chữ nét.
+
+### v1.3.0: zoom mượt
+
+- **Chế độ Smooth (mặc định)**: crop filter của OBS chỉ nhận số nguyên, nên khi kéo chuột chậm khung "đứng — nhảy 1 pixel — đứng" (ở 2× là nhảy 2 pixel trên hình). Giờ một filter shader riêng dịch khung theo **phần lẻ pixel** và phóng to bằng **bicubic Catmull-Rom**. Đo trong OBS thật, cùng một cú kéo chuột chậm: Crop đứng hình 27/66 lần, Smooth 0–2/65.
+- **Khung bám chuột bằng lò xo giảm chấn** (kiểu SmoothDamp) thay cho lerp: tăng tốc và giảm tốc tự nhiên, không còn vọt mạnh lúc chuột chạm mép vùng khóa, không vọt quá đích.
+- Smooth không đổi transform của source (không còn tự chuyển sang bounding box).
+- Mặc định mới: Zoom Speed 0.05, Follow Speed 0.18.
 
 ### v1.2.0: sửa zoom ở màn hình rời
 
@@ -361,9 +369,10 @@ python3 tests/mutate.py         # mutation test: cài lỗi vào script, test ph
 sudo apt install obs-studio xvfb ffmpeg xdotool && pip install websocket-client
 python3 tests/e2e_obs.py ảnh_mặt.png out/
 python3 tests/demo_record.py out/   # quay video Zoom to Mouse: phím F9/F10/F11, di chuột, click — tất cả bằng xdotool
+ZOOM_MODE=crop python3 tests/demo_record.py out/   # cùng kịch bản ở chế độ Crop để so sánh
 ```
 
-`mutate.py` cài lại từng lỗi thật vào một bản sao script (gồm cả các lỗi của zoom-to-mouse v1.0.1 ở trên) và yêu cầu test phải **đỏ**. Mutant nào vẫn xanh nghĩa là test đang hở chỗ đó. Lượt đầu chạy có 14/42 mutant sống sót; viết thêm test cho tới khi bắt được hết thì lộ ra một lỗi thật (pomodoro trôi vài giây sau mỗi chục pha). Hiện tại 84/84 mutant đều bị bắt, kể cả mutant cài lại lỗi deadlock (mock mô phỏng luôn luật khóa của OBS) và các lỗi màn hình rời của v1.1.0.
+`mutate.py` cài lại từng lỗi thật vào một bản sao script (gồm cả các lỗi của zoom-to-mouse v1.0.1 ở trên) và yêu cầu test phải **đỏ**. Mutant nào vẫn xanh nghĩa là test đang hở chỗ đó. Lượt đầu chạy có 14/42 mutant sống sót; viết thêm test cho tới khi bắt được hết thì lộ ra một lỗi thật (pomodoro trôi vài giây sau mỗi chục pha). Hiện tại 92/92 mutant đều bị bắt, kể cả mutant cài lại lỗi deadlock (mock mô phỏng luôn luật khóa của OBS) và các lỗi màn hình rời của v1.1.0.
 
 `e2e_obs.py` mở OBS thật trên màn hình ảo (Xvfb, render bằng Mesa) và load cả 11 script. Qua obs-websocket, nó:
 - dùng `xdotool` đưa chuột thật tới một điểm trên Screen Capture (XSHM), bấm phím zoom và kiểm crop filter; bấm phím "dùng màn hình đang có chuột" để đọc màn hình qua XRandR;
@@ -378,7 +387,7 @@ Phần đọc chuột, click, thời gian rảnh (FFI) và phím tắt vẫn c�
 
 ## Lịch sử phiên bản Zoom to Mouse
 
-v1.2.0 (sửa màn hình rời) và v1.1.0: xem [mục 2](#2-zoom-to-mouse-v120).
+v1.3.0 (zoom mượt), v1.2.0 (màn hình rời) và v1.1.0: xem [mục 2](#2-zoom-to-mouse-v130).
 
 ### v1.0.1 (Optimized Version)
 

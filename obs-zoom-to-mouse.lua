@@ -1,5 +1,5 @@
 --[[
-    OBS Zoom to Mouse — v1.2.0
+    OBS Zoom to Mouse — v1.3.0
     Zoom a display-capture source to focus on the mouse cursor.
 
     Original script : BlankSourceCode (https://github.com/BlankSourceCode/obs-zoom-to-mouse)
@@ -22,9 +22,13 @@ local obs = obslua
 local ffi = require("ffi")
 local bit = require("bit")
 
-local VERSION = "1.2.0"
+local VERSION = "1.3.0"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 local SHARPEN_FILTER_NAME = "obs-zoom-to-mouse-sharpen"
+-- Smooth mode: our own shader filter that takes a sub-pixel view rectangle (the crop filter only
+-- takes whole pixels, which makes slow pans step 1 source pixel = 2+ screen pixels at a time)
+local VIEW_FILTER_ID = "algen_zoom_to_mouse_view"
+local VIEW_FILTER_NAME = "obs-zoom-to-mouse-view"
 local NONE_SOURCE = "obs-zoom-to-mouse-none"
 local MAX_ZOOM = 10
 
@@ -106,6 +110,8 @@ local zoom_speed = 0.1
 local zoom_step = 0.5
 local use_click_zoom = false
 local auto_zoom_out_delay = 3
+local use_smooth = true
+local follow_vel = { x = 0, y = 0 }
 local scale_filter_zoomed = SCALE_LANCZOS
 local sharpen_strength = 0.1
 local allow_all_sources = false
@@ -684,6 +690,183 @@ function is_display_capture(source_to_check)
     return dc_info ~= nil and obs.obs_source_get_id(source_to_check) == dc_info.source_id
 end
 
+------------------------------------------------------------------------------
+-- Smooth zoom filter: samples the source at a floating-point view rectangle with Catmull-Rom
+-- bicubic interpolation, so panning is sub-pixel smooth and the upscale stays sharp.
+
+local VIEW_EFFECT = [==[
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 tex_size;
+uniform float4 view;
+
+sampler_state def_sampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+    VertData vert_out;
+    vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    vert_out.uv  = v_in.uv;
+    return vert_out;
+}
+
+float4 tap(float2 px)
+{
+    return image.Sample(def_sampler, px / tex_size);
+}
+
+// Catmull-Rom bicubic in 9 bilinear taps
+float4 bicubic(float2 px)
+{
+    float2 p1 = floor(px - 0.5) + 0.5;
+    float2 f = px - p1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 p0 = p1 - 1.0;
+    float2 p3 = p1 + 2.0;
+    float2 p12 = p1 + w2 / w12;
+    float4 c = tap(float2(p0.x, p0.y)) * w0.x * w0.y
+             + tap(float2(p12.x, p0.y)) * w12.x * w0.y
+             + tap(float2(p3.x, p0.y)) * w3.x * w0.y
+             + tap(float2(p0.x, p12.y)) * w0.x * w12.y
+             + tap(float2(p12.x, p12.y)) * w12.x * w12.y
+             + tap(float2(p3.x, p12.y)) * w3.x * w12.y
+             + tap(float2(p0.x, p3.y)) * w0.x * w3.y
+             + tap(float2(p12.x, p3.y)) * w12.x * w3.y
+             + tap(float2(p3.x, p3.y)) * w3.x * w3.y;
+    return saturate(c);
+}
+
+float4 PSZoom(VertData v_in) : TARGET
+{
+    return bicubic(view.xy + v_in.uv * view.zw);
+}
+
+technique Draw
+{
+    pass
+    {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSZoom(v_in);
+    }
+}
+]==]
+
+local view_filter = {}
+view_filter.id = VIEW_FILTER_ID
+view_filter.type = obs.OBS_SOURCE_TYPE_FILTER
+view_filter.output_flags = obs.OBS_SOURCE_VIDEO
+
+view_filter.get_name = function()
+    return "Zoom to Mouse (smooth view)"
+end
+
+view_filter.create = function(settings, src)
+    local data = { source = src, tex_size = obs.vec2(), view = obs.vec4(), x = 0, y = 0, w = 0, h = 0 }
+    obs.obs_enter_graphics()
+    data.effect = obs.gs_effect_create(VIEW_EFFECT, "zoom_to_mouse_view.effect", nil)
+    if data.effect ~= nil then
+        data.p_tex = obs.gs_effect_get_param_by_name(data.effect, "tex_size")
+        data.p_view = obs.gs_effect_get_param_by_name(data.effect, "view")
+    end
+    obs.obs_leave_graphics()
+    if data.effect == nil then
+        obs.script_log(obs.OBS_LOG_ERROR, "[zoom-to-mouse] Smooth zoom shader failed to compile, use Zoom mode: Crop")
+        return nil
+    end
+    view_filter.update(data, settings)
+    return data
+end
+
+view_filter.destroy = function(data)
+    if data.effect ~= nil then
+        obs.obs_enter_graphics()
+        obs.gs_effect_destroy(data.effect)
+        obs.obs_leave_graphics()
+        data.effect = nil
+    end
+end
+
+-- A Lua filter without get_width/get_height is 0x0 to OBS (the whole source disappears),
+-- so report the input size, read once per frame in video_tick
+view_filter.video_tick = function(data, seconds)
+    local target = obs.obs_filter_get_target(data.source)
+    data.tw = target and obs.obs_source_get_base_width(target) or 0
+    data.th = target and obs.obs_source_get_base_height(target) or 0
+end
+
+view_filter.get_width = function(data)
+    return data.tw or 0
+end
+
+view_filter.get_height = function(data)
+    return data.th or 0
+end
+
+view_filter.update = function(data, settings)
+    data.x = obs.obs_data_get_double(settings, "x")
+    data.y = obs.obs_data_get_double(settings, "y")
+    data.w = obs.obs_data_get_double(settings, "w")
+    data.h = obs.obs_data_get_double(settings, "h")
+end
+
+view_filter.video_render = function(data, effect)
+    local tw, th = data.tw or 0, data.th or 0
+    -- Not zoomed (or no size yet): pass the picture through untouched
+    if tw == 0 or th == 0 or data.w <= 0 or data.h <= 0 or
+        (data.w >= tw - 0.01 and data.h >= th - 0.01 and math.abs(data.x) < 0.01 and math.abs(data.y) < 0.01) then
+        obs.obs_source_skip_video_filter(data.source)
+        return
+    end
+    if not obs.obs_source_process_filter_begin(data.source, obs.GS_RGBA, obs.OBS_NO_DIRECT_RENDERING) then
+        return
+    end
+    data.tex_size.x, data.tex_size.y = tw, th
+    data.view.x, data.view.y, data.view.z, data.view.w = data.x, data.y, data.w, data.h
+    obs.gs_effect_set_vec2(data.p_tex, data.tex_size)
+    obs.gs_effect_set_vec4(data.p_view, data.view)
+    obs.obs_source_process_filter_end(data.source, data.effect, tw, th)
+end
+
+obs.obs_register_source(view_filter)
+
+---
+-- Critically damped spring (same idea as Unity's SmoothDamp): eases in AND out, never overshoots.
+---@return number position, number velocity
+function smooth_damp(current, target, velocity, smooth_time, dt)
+    local omega = 2 / math.max(0.0001, smooth_time)
+    local x = omega * dt
+    local decay = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
+    local change = current - target
+    local temp = (velocity + omega * change) * dt
+    local new_velocity = (velocity - omega * temp) * decay
+    local out = target + (change + temp) * decay
+    -- Don't overshoot the target
+    if (target - current > 0) == (out > target) then
+        out = target
+        new_velocity = 0
+    end
+    return out, new_velocity
+end
+
+---
+-- Follow Speed (0.01 - 1) as the spring's smoothing time: 0.25 -> 0.12 s, 0.1 -> 0.3 s
+function follow_smooth_time()
+    return clamp(0.03, 1.0, 0.03 / math.max(0.01, follow_speed))
+end
+
 function start_timer()
     if not is_timer_running then
         is_timer_running = true
@@ -920,8 +1103,9 @@ function refresh_sceneitem(find_newest)
         log("Using source size: " .. source_width .. ", " .. source_height)
     end
 
-    -- Convert the current transform into a bounding box one that we can modify for zooming
-    if sceneitem_info.bounds_type == obs.OBS_BOUNDS_NONE then
+    -- Crop mode changes the source size, so the transform must scale into a bounding box.
+    -- Smooth mode keeps the size, so the user's transform is left alone.
+    if not use_smooth and sceneitem_info.bounds_type == obs.OBS_BOUNDS_NONE then
         sceneitem_info.bounds_type = obs.OBS_BOUNDS_SCALE_INNER
         sceneitem_info.bounds_alignment = 5 -- (5 == OBS_ALIGN_TOP | OBS_ALIGN_LEFT)
         sceneitem_info.bounds.x = source_width * sceneitem_info.scale.x
@@ -1007,12 +1191,24 @@ function refresh_sceneitem(find_newest)
     crop_filter_info_orig = { x = 0, y = 0, w = source_width, h = source_height }
     crop_filter_info = { x = 0, y = 0, w = source_width, h = source_height }
 
-    -- Get or create our crop filter that we change during zoom
-    crop_filter = obs.obs_source_get_filter_by_name(source, CROP_FILTER_NAME)
+    -- Leftover zoom filter from the other mode (e.g. OBS crashed while zoomed): remove it
+    local stale = obs.obs_source_get_filter_by_name(source, use_smooth and CROP_FILTER_NAME or VIEW_FILTER_NAME)
+    if stale ~= nil then
+        obs.obs_source_filter_remove(source, stale)
+        obs.obs_source_release(stale)
+    end
+
+    -- Get or create our zoom filter that we change during zoom
+    local filter_name = use_smooth and VIEW_FILTER_NAME or CROP_FILTER_NAME
+    crop_filter = obs.obs_source_get_filter_by_name(source, filter_name)
     if crop_filter == nil then
         crop_filter_settings = obs.obs_data_create()
-        obs.obs_data_set_bool(crop_filter_settings, "relative", false)
-        crop_filter = obs.obs_source_create_private("crop_filter", CROP_FILTER_NAME, crop_filter_settings)
+        if use_smooth then
+            crop_filter = obs.obs_source_create_private(VIEW_FILTER_ID, filter_name, crop_filter_settings)
+        else
+            obs.obs_data_set_bool(crop_filter_settings, "relative", false)
+            crop_filter = obs.obs_source_create_private("crop_filter", filter_name, crop_filter_settings)
+        end
         obs.obs_source_filter_add(source, crop_filter)
     else
         crop_filter_settings = obs.obs_source_get_settings(crop_filter)
@@ -1020,6 +1216,7 @@ function refresh_sceneitem(find_newest)
 
     obs.obs_source_filter_set_order(source, crop_filter, obs.OBS_ORDER_MOVE_BOTTOM)
     crop_last_applied.x = -1 -- force the first update through
+    follow_vel.x, follow_vel.y = 0, 0
     set_crop_settings(crop_filter_info_orig)
 end
 
@@ -1088,8 +1285,12 @@ function get_target_position(zoom)
     }
 
     -- Keep the zoom inside the source so we never show something the user is hiding with a crop
-    crop.x = math.floor(clamp(0, (zoom.source_size.width - new_size.width), crop.x))
-    crop.y = math.floor(clamp(0, (zoom.source_size.height - new_size.height), crop.y))
+    crop.x = clamp(0, (zoom.source_size.width - new_size.width), crop.x)
+    crop.y = clamp(0, (zoom.source_size.height - new_size.height), crop.y)
+    if not use_smooth then
+        crop.x = math.floor(crop.x)
+        crop.y = math.floor(crop.y)
+    end
 
     return {
         crop = crop,
@@ -1101,6 +1302,7 @@ end
 ---
 -- Start an animation from the current crop to the target
 function begin_animation(state, target)
+    follow_vel.x, follow_vel.y = 0, 0
     zoom_state = state
     zoom_time = 0
     zoom_target = target
@@ -1334,13 +1536,20 @@ function update_follow(frames)
     end
 
     if locked_center == nil and (zoom_target.crop.x ~= crop_filter_info.x or zoom_target.crop.y ~= crop_filter_info.y) then
-        -- Same feel as a per-frame lerp at 60fps, but independent of the OBS frame rate
-        local t = 1 - math.pow(1 - follow_speed, frames)
-        crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, t)
-        crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, t)
-        -- Snap the last half pixel, otherwise the lerp never reaches the edge and floor() leaves it 1px short
-        if math.abs(crop_filter_info.x - zoom_target.crop.x) < 0.5 then crop_filter_info.x = zoom_target.crop.x end
-        if math.abs(crop_filter_info.y - zoom_target.crop.y) < 0.5 then crop_filter_info.y = zoom_target.crop.y end
+        -- Spring instead of a plain lerp: the view accelerates and decelerates smoothly instead of
+        -- jumping to full speed the moment the mouse reaches the edge. Frame-rate independent.
+        local dt = frames / 60
+        local st = follow_smooth_time()
+        crop_filter_info.x, follow_vel.x = smooth_damp(crop_filter_info.x, zoom_target.crop.x, follow_vel.x, st, dt)
+        crop_filter_info.y, follow_vel.y = smooth_damp(crop_filter_info.y, zoom_target.crop.y, follow_vel.y, st, dt)
+        -- Snap the last bit, otherwise floor() (crop mode) leaves the view 1px short of the edge
+        local snap = use_smooth and 0.05 or 0.5
+        if math.abs(crop_filter_info.x - zoom_target.crop.x) < snap then
+            crop_filter_info.x, follow_vel.x = zoom_target.crop.x, 0
+        end
+        if math.abs(crop_filter_info.y - zoom_target.crop.y) < snap then
+            crop_filter_info.y, follow_vel.y = zoom_target.crop.y, 0
+        end
         set_crop_settings(crop_filter_info)
 
         -- Check to see if the mouse has stopped moving long enough to create a new safe zone
@@ -1444,11 +1653,28 @@ function set_crop_settings(crop)
         return
     end
 
+    local last = crop_last_applied
+    if use_smooth then
+        -- Sub-pixel view: only skip changes too small to see (1/100 px)
+        local x, y, w, h = crop.x, crop.y, crop.w, crop.h
+        if math.abs(last.x - x) < 0.01 and math.abs(last.y - y) < 0.01 and
+            math.abs(last.w - w) < 0.01 and math.abs(last.h - h) < 0.01 then
+            return
+        end
+        last.x, last.y, last.w, last.h = x, y, w, h
+        obs.obs_data_set_double(crop_filter_settings, "x", x)
+        obs.obs_data_set_double(crop_filter_settings, "y", y)
+        obs.obs_data_set_double(crop_filter_settings, "w", w)
+        obs.obs_data_set_double(crop_filter_settings, "h", h)
+        obs.obs_source_update(crop_filter, crop_filter_settings)
+        update_zoom_quality(w)
+        return
+    end
+
     local x = math.floor(crop.x)
     local y = math.floor(crop.y)
     local w = math.floor(crop.w)
     local h = math.floor(crop.h)
-    local last = crop_last_applied
     if last.x == x and last.y == y and last.w == w and last.h == h then
         return
     end
@@ -1505,7 +1731,8 @@ function update_zoom_quality(crop_w)
     local ratio = crop_filter_info_orig.w / crop_w
     local zoomed = ratio > 1.001
 
-    if scale_filter_orig ~= nil then
+    -- In smooth mode our shader does the (bicubic) upscale and OBS never scales the item
+    if scale_filter_orig ~= nil and not use_smooth then
         local want = scale_filter_orig
         if zoomed and scale_filter_zoomed ~= SCALE_KEEP then
             want = scale_filter_zoomed
@@ -1627,6 +1854,10 @@ function on_settings_modified(props, prop, settings)
             obs.obs_property_set_visible(obs.obs_properties_get(props, p), visible)
         end
         return true
+    elseif name == "zoom_mode" then
+        obs.obs_property_set_visible(obs.obs_properties_get(props, "scale_filter"),
+            obs.obs_data_get_string(settings, "zoom_mode") == "crop")
+        return true
     elseif name == "click_zoom" then
         obs.obs_property_set_visible(obs.obs_properties_get(props, "auto_zoom_out_delay"),
             obs.obs_data_get_bool(settings, "click_zoom"))
@@ -1651,6 +1882,7 @@ function log_current_settings()
     local settings = {
         zoom_value = zoom_value,
         zoom_speed = zoom_speed,
+        use_smooth = use_smooth,
         zoom_step = zoom_step,
         use_click_zoom = use_click_zoom,
         auto_zoom_out_delay = auto_zoom_out_delay,
@@ -1689,6 +1921,7 @@ function on_print_help()
         "Zoom Factor: How much to zoom in by\n" ..
         "Zoom Step: How much the 'Zoom in more/less' hotkeys change the zoom factor\n" ..
         "Zoom Speed: The speed of the zoom in/out animation (frame-rate independent)\n" ..
+        "Zoom mode: Smooth (sub-pixel shader + bicubic, default) or Crop (classic crop filter)\n" ..
         "Scale filter while zoomed: Lanczos/Bicubic keep the zoomed image sharper than bilinear\n" ..
         "Sharpen while zoomed: Strength of a Sharpen filter that fades in with the zoom (0 = off)\n" ..
         "Auto zoom on click: Left click inside the source zooms in automatically\n" ..
@@ -1743,6 +1976,15 @@ function script_properties()
     local delay = obs.obs_properties_add_float_slider(props, "auto_zoom_out_delay", "Auto zoom out after (s)", 0, 30, 0.5)
     obs.obs_property_set_long_description(delay,
         "Zoom back out after this many seconds without mouse activity (0 = never). Only for click zooms.")
+
+    local mode = obs.obs_properties_add_list(props, "zoom_mode", "Zoom mode",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(mode, "Smooth — sub-pixel + bicubic (recommended)", "smooth")
+    obs.obs_property_list_add_string(mode, "Crop filter (classic)", "crop")
+    obs.obs_property_set_long_description(mode,
+        "Smooth: a shader moves the view by fractions of a pixel and upscales with bicubic — no stepping " ..
+        "when panning slowly, and your transform is left untouched. Crop: the original crop-filter method.")
+    obs.obs_property_set_modified_callback(mode, on_settings_modified)
 
     local scale = obs.obs_properties_add_list(props, "scale_filter", "Scale filter while zoomed",
         obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
@@ -1832,6 +2074,7 @@ function read_settings(settings)
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
     zoom_step = obs.obs_data_get_double(settings, "zoom_step")
     zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    use_smooth = obs.obs_data_get_string(settings, "zoom_mode") ~= "crop"
     use_click_zoom = obs.obs_data_get_bool(settings, "click_zoom")
     auto_zoom_out_delay = obs.obs_data_get_double(settings, "auto_zoom_out_delay")
     scale_filter_zoomed = obs.obs_data_get_int(settings, "scale_filter")
@@ -1939,14 +2182,15 @@ end
 function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "zoom_value", 2)
     obs.obs_data_set_default_double(settings, "zoom_step", 0.5)
-    obs.obs_data_set_default_double(settings, "zoom_speed", 0.06)
+    obs.obs_data_set_default_double(settings, "zoom_speed", 0.05)
+    obs.obs_data_set_default_string(settings, "zoom_mode", "smooth")
     obs.obs_data_set_default_bool(settings, "click_zoom", false)
     obs.obs_data_set_default_double(settings, "auto_zoom_out_delay", 3)
     obs.obs_data_set_default_int(settings, "scale_filter", SCALE_LANCZOS)
     obs.obs_data_set_default_double(settings, "sharpen", 0.1)
     obs.obs_data_set_default_bool(settings, "follow", true)
     obs.obs_data_set_default_bool(settings, "follow_outside_bounds", false)
-    obs.obs_data_set_default_double(settings, "follow_speed", 0.25)
+    obs.obs_data_set_default_double(settings, "follow_speed", 0.18)
     obs.obs_data_set_default_int(settings, "follow_border", 8)
     obs.obs_data_set_default_int(settings, "follow_safezone_sensitivity", 4)
     obs.obs_data_set_default_bool(settings, "follow_auto_lock", false)
@@ -1976,6 +2220,7 @@ end
 
 function script_update(settings)
     local old_source_name = source_name
+    local old_smooth = use_smooth
     local old_override = {
         use_monitor_override, monitor_override_x, monitor_override_y, monitor_override_w, monitor_override_h,
         monitor_override_sx, monitor_override_sy, monitor_override_dw, monitor_override_dh
@@ -1984,8 +2229,8 @@ function script_update(settings)
     source_name = obs.obs_data_get_string(settings, "source")
     read_settings(settings)
 
-    -- Only do the expensive refresh if the user selected a new source
-    if source_name ~= old_source_name then
+    -- Only do the expensive refresh if the user selected a new source or switched the zoom mode
+    if source_name ~= old_source_name or use_smooth ~= old_smooth then
         refresh_sceneitem(true)
     end
 

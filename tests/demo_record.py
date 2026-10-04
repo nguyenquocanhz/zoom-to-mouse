@@ -25,6 +25,7 @@ import websocket
 ROOT = Path(__file__).resolve().parent.parent
 W, H = 1280, 720
 DISPLAY = ":97"
+MODE = os.environ.get("ZOOM_MODE", "smooth")  # smooth | crop — record both to compare
 
 
 def make_background(path: Path):
@@ -74,7 +75,7 @@ def write_config(home: Path, rec: Path):
             ]}},
         ],
         "modules": {"scripts-tool": [{"path": str(ROOT / "obs-zoom-to-mouse.lua"), "settings": {
-            "source": "Desktop", "click_zoom": True, "auto_zoom_out_delay": 2.0, "debug_logs": False,
+            "source": "Desktop", "click_zoom": True, "zoom_mode": MODE, "auto_zoom_out_delay": 2.0, "debug_logs": False,
             "obs_zoom_to_mouse.hotkey.zoom": key("OBS_KEY_F9"),
             "obs_zoom_to_mouse.hotkey.zoom_more": key("OBS_KEY_F10"),
             "obs_zoom_to_mouse.hotkey.zoom_less": key("OBS_KEY_F11"),
@@ -160,18 +161,32 @@ def main():
         caption = lambda t: o.req("SetInputSettings", inputName="Caption", inputSettings={"text": t})
         pos = [0, 0]
 
-        def glide(x, y, seconds):
+        def view_x():
+            for f in o.req("GetSourceFilterList", sourceName="Desktop")["filters"]:
+                st = f["filterSettings"]
+                if f["filterName"] == "obs-zoom-to-mouse-view":
+                    return st.get("x", 0)
+                if f["filterName"] == "obs-zoom-to-mouse-crop":
+                    return st.get("left", 0)
+            return 0
+
+        def glide(x, y, seconds, samples=None):
             steps = max(1, int(seconds * 30))
             x0, y0 = pos
             for i in range(1, steps + 1):
                 xdo("mousemove", int(x0 + (x - x0) * i / steps), int(y0 + (y - y0) * i / steps))
                 time.sleep(seconds / steps)
+                if samples is not None:
+                    samples.append(view_x())
             pos[:] = [x, y]
 
         def crop():
+            """View rectangle (x, y, w, h) of the zoom filter, rounded to whole pixels."""
             for f in o.req("GetSourceFilterList", sourceName="Desktop")["filters"]:
+                s = f["filterSettings"]
+                if f["filterName"] == "obs-zoom-to-mouse-view":
+                    return tuple(int(round(s.get(k, 0))) for k in ("x", "y", "w", "h"))
                 if f["filterName"] == "obs-zoom-to-mouse-crop":
-                    s = f["filterSettings"]
                     return s.get("left"), s.get("top"), s.get("cx"), s.get("cy")
             return None
 
@@ -181,7 +196,7 @@ def main():
 
         xdo("mousemove", 200, 150)
         pos[:] = [200, 150]
-        caption("Zoom to Mouse v1.2.0 — test bằng chuột & phím THẬT")
+        caption(f"Zoom to Mouse v1.3.0 — chế độ {MODE.upper()} — chuột & phím THẬT")
         # Keep the background above any OBS window (e.g. the Script Log) for the whole recording
         subprocess.run(["xdotool", "search", "--class", "ffplay", "windowraise"], env=env)
         o.req("StartRecord")
@@ -207,6 +222,21 @@ def main():
         time.sleep(1.5)
         c = crop()
         check("follow back", inside(c, 420, 420), f"crop {c} chứa chuột (420,420)")
+
+        caption("Kéo chuột thật chậm sang phải → khung trượt theo")
+        samples = []
+        glide(900, 420, 5.0, samples)
+        time.sleep(1.0)
+        c = crop()
+        check("slow pan", inside(c, 900, 420), f"crop {c} chứa chuột (900,420)")
+        # Smoothness while the view is moving: frozen samples vs. samples that moved
+        moving = [b - a for a, b in zip(samples, samples[1:])]
+        first = next((i for i, d in enumerate(moving) if abs(d) > 0.01), len(moving))
+        moving = moving[first:]
+        frozen = sum(1 for d in moving if abs(d) < 0.01)
+        print(f"  pan  {MODE}: {len(moving)} mẫu khi khung đang trượt, đứng yên {frozen}, "
+              f"bước lớn nhất {max(moving, default=0):.2f}px, nhỏ nhất {min(moving, default=0):.2f}px")
+        (out / f"pan-{MODE}.json").write_text(json.dumps(samples))
 
         caption("F10 → zoom thêm (2.5x)")
         press("F10")
@@ -244,9 +274,19 @@ def main():
         time.sleep(1.5)
         path = o.req("StopRecord")["outputPath"]
         time.sleep(2)
+        name = f"zoom-demo-{MODE}.mp4"
         subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", path, "-c", "copy", "-movflags", "+faststart",
-                        str(out / "zoom-demo.mp4")], check=True)
-        print("video:", out / "zoom-demo.mp4")
+                        str(out / name)], check=True)
+        print("video:", out / name)
+
+        # The picture itself must not be black (a 0x0 filter blanks the whole capture while every
+        # number above still looks right). Average brightness at 3 s (normal) and 6 s (zoomed).
+        for t in (3, 6):
+            r = subprocess.run(["ffmpeg", "-ss", str(t), "-i", str(out / name), "-frames:v", "1", "-vf",
+                                "signalstats,metadata=print:key=lavfi.signalstats.YAVG", "-f", "null", "-"],
+                               capture_output=True, text=True)
+            yavg = float(r.stderr.split("YAVG=")[-1].split()[0]) if "YAVG=" in r.stderr else 0
+            check(f"video not black @{t}s", yavg > 25, f"độ sáng trung bình {yavg:.1f} (đen ≈ 16)")
     finally:
         for p in reversed(procs):
             p.send_signal(signal.SIGTERM)

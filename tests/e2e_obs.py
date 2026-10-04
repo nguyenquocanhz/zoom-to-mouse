@@ -277,12 +277,14 @@ def main():
         time.sleep(0.3)
         o.req("TriggerHotkeyByName", hotkeyName="toggle_zoom_hotkey")
         time.sleep(1.5)
-        crop = next((f for f in o.req("GetSourceFilterList", sourceName="Desktop")["filters"]
-                     if f["filterName"] == "obs-zoom-to-mouse-crop"), None)
-        cs = crop["filterSettings"] if crop else {}
-        # 2560x720 capture, zoom 2 -> 1280x360 crop centred on (1500,100), clamped to the top
-        check(cs.get("cx") == 1280 and cs.get("cy") == 360, f"zoom crop size 1280x360 (got {cs.get('cx')}x{cs.get('cy')})")
-        check(cs.get("left") == 860 and cs.get("top") == 0, f"zoom follows the real mouse (got {cs.get('left')},{cs.get('top')})")
+        view = next((f for f in o.req("GetSourceFilterList", sourceName="Desktop")["filters"]
+                     if f["filterName"] == "obs-zoom-to-mouse-view"), None)
+        vs = view["filterSettings"] if view else {}
+        r = lambda k: round(vs.get(k, -1), 2)
+        # 2560x720 capture, zoom 2 -> 1280x360 view centred on (1500,100), clamped to the top
+        check(r("w") == 1280 and r("h") == 360, f"smooth zoom view 1280x360 (got {r('w')}x{r('h')})")
+        check(r("x") == 860 and r("y") == 0, f"zoom follows the real mouse (got {r('x')},{r('y')})")
+        o.req("SaveSourceScreenshot", sourceName="Desktop", imageFormat="png", imageFilePath=str(out / "zoom-smooth.png"))
         o.req("TriggerHotkeyByName", hotkeyName="toggle_zoom_hotkey")
         time.sleep(1.5)
         o.req("TriggerHotkeyByName", hotkeyName="zoom_calibrate_hotkey")

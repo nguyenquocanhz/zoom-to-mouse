@@ -25,7 +25,7 @@ display.prop_list = { name = "screen", items = {
     { "Screen 1: 2560x1440 @ 1920,0", 1 },
 } }
 
-local settings = H.start(env, M, { source = "Display", debug_logs = true })
+local settings = H.start(env, M, { source = "Display", debug_logs = true, zoom_mode = "crop" })
 local function cv(k)
     local crop = obs.obs_source_get_filter_by_name(display, "obs-zoom-to-mouse-crop")
     return crop and crop.settings.vals[k]

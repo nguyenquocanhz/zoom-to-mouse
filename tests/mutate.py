@@ -23,7 +23,8 @@ CF = "cartoon-face.lua"
 FM = "face-mask.lua"
 SW = "smooth-scene-switcher.lua"
 ZM = "obs-zoom-to-mouse.lua#monitors"  # same script, checked by test_zoom_monitors.lua
-TEST = {Z: "test_zoom.lua", ZM: "test_zoom_monitors.lua", C: "test_countdown.lua", P: "test_pomodoro.lua", A: "test_afk.lua",
+ZS = "obs-zoom-to-mouse.lua#smooth"    # same script, checked by test_zoom_smooth.lua
+TEST = {Z: "test_zoom.lua", ZM: "test_zoom_monitors.lua", ZS: "test_zoom_smooth.lua", C: "test_countdown.lua", P: "test_pomodoro.lua", A: "test_afk.lua",
         R: "test_replay.lua", CH: "test_chapters.lua", L: "test_live_timer.lua", T: "test_ticker.lua",
         CF: "test_cartoon.lua", FM: "test_mask.lua", SW: "test_switcher.lua"}
 
@@ -33,15 +34,13 @@ MUTANTS = [
     ("zoom-v101-restore-get-info", Z, "sceneitem_set_info(sceneitem, sceneitem_info_orig)",
      "sceneitem_get_info(sceneitem, sceneitem_info_orig)"),
     ("zoom-v101-monitor-off-by-one", Z, "for i = 0, item_count - 1 do", "for i = 0, item_count do"),
-    ("zoom-v101-edge-1px-short", Z,
-     "if math.abs(crop_filter_info.x - zoom_target.crop.x) < 0.5 then crop_filter_info.x = zoom_target.crop.x end", ""),
+    ("zoom-v101-edge-1px-short", Z, "        if math.abs(crop_filter_info.x - zoom_target.crop.x) < snap then\n            crop_filter_info.x, follow_vel.x = zoom_target.crop.x, 0\n        end\n", ""),
     ("zoom-v101-update-every-frame", Z,
      "if last.x == x and last.y == y and last.w == w and last.h == h then", "if false then"),
     ("zoom-v101-lerp-from-current", Z, "lerp(anim_from.x, zoom_target.crop.x, e)",
      "lerp(crop_filter_info.x, zoom_target.crop.x, e)"),
     ("zoom-v101-fps-dependent", Z, "zoom_time + zoom_speed * frames", "zoom_time + zoom_speed"),
-    ("zoom-v101-follow-fps-dependent", Z, "local t = 1 - math.pow(1 - follow_speed, frames)",
-     "local t = follow_speed"),
+    ("zoom-v101-follow-fps-dependent", Z, "        local dt = frames / 60\n", "        local dt = 1 / 60\n"),
     ("zoom-v101-no-reverse", Z,
      "if zoom_state == ZoomState.ZoomedIn or zoom_state == ZoomState.ZoomingIn then\n        start_zoom_out()",
      "if zoom_state == ZoomState.ZoomedIn then\n        start_zoom_out()"),
@@ -57,8 +56,7 @@ MUTANTS = [
      "if false then"),
     ("zoom-auto-out-never", Z, "now - last_activity >= auto_zoom_out_delay then", "now - last_activity >= auto_zoom_out_delay * 100 then"),
     ("zoom-sharpen-not-progressive", Z, "clamp(0, 1, ratio - 1)", "1"),
-    ("zoom-no-clamp-to-source", Z,
-     "crop.x = math.floor(clamp(0, (zoom.source_size.width - new_size.width), crop.x))", "crop.x = math.floor(crop.x)"),
+    ("zoom-no-clamp-to-source", Z, "crop.x = clamp(0, (zoom.source_size.width - new_size.width), crop.x)", "crop.x = crop.x"),
     ("zoom-level-unclamped", Z, "zoom_value = clamp(1, MAX_ZOOM, zoom_value + delta)", "zoom_value = zoom_value + delta"),
     ("zoom-hotkey-no-refresh", Z, '        log("Sceneitem is nil, attempting refresh...")\n        refresh_sceneitem(true)', ""),
     # --- countdown ---
@@ -150,6 +148,16 @@ MUTANTS = [
     ("zoom-calibrate-not-saved", ZM, '                obs.obs_data_set_int(script_settings, "monitor_override_x", monitor_override_x)\n', ""),
     ("zoom-false-error-at-startup", ZM, "    if source == nil then\n        return\n    end\n\n    -- Always", "    -- Always"),
     ("zoom-stale-user-crop", ZM, " or user_crop_signature(source) ~= zoom_info.crop_sig then", " then"),
+    # --- zoom: smooth mode ---
+    ("zoom-smooth-zero-size", ZS, "view_filter.get_width = function(data)\n    return data.tw or 0", "view_filter.get_width = function(data)\n    return 0"),
+    ("zoom-smooth-floors", ZS, "    if not use_smooth then\n        crop.x = math.floor(crop.x)", "    if true then\n        crop.x = math.floor(crop.x)"),
+    ("zoom-smooth-lerp-follow", ZS, "crop_filter_info.x, follow_vel.x = smooth_damp(crop_filter_info.x, zoom_target.crop.x, follow_vel.x, st, dt)",
+     "crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, 1 - math.pow(0.75, frames))"),
+    ("zoom-smooth-overshoot", ZS, "    if (target - current > 0) == (out > target) then", "    if false then"),
+    ("zoom-smooth-converts-transform", ZS, "if not use_smooth and sceneitem_info.bounds_type == obs.OBS_BOUNDS_NONE then", "if sceneitem_info.bounds_type == obs.OBS_BOUNDS_NONE then"),
+    ("zoom-smooth-no-passthrough", ZS, "        obs.obs_source_skip_video_filter(data.source)\n        return\n    end\n    if not obs.obs_source_process_filter_begin", "    end\n    if not obs.obs_source_process_filter_begin"),
+    ("zoom-smooth-stale-crop-kept", ZS, "    if stale ~= nil then\n        obs.obs_source_filter_remove(source, stale)", "    if false then\n        obs.obs_source_filter_remove(source, stale)"),
+    ("zoom-smooth-dedupe-integer", ZS, "        if math.abs(last.x - x) < 0.01 and", "        if math.abs(last.x - x) < 1 and"),
 ]
 
 
