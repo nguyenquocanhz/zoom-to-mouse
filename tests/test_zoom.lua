@@ -16,6 +16,7 @@ env.is_left_button_down = function() return button end
 
 local settings = H.start(env, M, {
     source = "Display",
+    zoom_mode = "crop", follow_speed = 0.25, zoom_speed = 0.06,
     use_monitor_override = true,
     monitor_override_x = 0, monitor_override_y = 0,
     monitor_override_w = 1920, monitor_override_h = 1080,
@@ -104,10 +105,18 @@ H.update(env, settings, { follow_border = 50 })
 mouse.x, mouse.y = 1000, 500
 M.advance(3000, 33)
 H.eq(cv("left"), 520, "follow settled on mouse")
+-- Same pan at 30 fps and at 60 fps must cover the same distance in the same time
 mouse.x = 1400 -- target left = 920, 400px away
-M.advance(198, 33) -- 6 ticks at 30fps = 11.88 frames of 60fps
-local expected_left = 920 - 400 * (1 - 0.25) ^ 11.88
-H.check(math.abs(cv("left") - expected_left) <= 3, "follow at 30fps: " .. cv("left") .. " vs " .. math.floor(expected_left))
+M.advance(198, 33) -- 6 ticks at 30fps
+local at30 = cv("left")
+mouse.x = 1000
+M.advance(3000, 16)
+H.eq(cv("left"), 520, "back on the mouse")
+mouse.x = 1400
+M.advance(198, 16) -- 12 ticks at 60fps
+local at60 = cv("left")
+H.check(at30 > 600 and at30 < 920 and math.abs(at30 - at60) <= 25,
+    "follow is frame-rate independent: 30fps " .. at30 .. " vs 60fps " .. at60)
 
 -- With no lock, a resting mouse must not push identical crop values every frame
 M.advance(3000, 16)

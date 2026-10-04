@@ -28,7 +28,9 @@ import websocket
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = [ROOT / "obs-zoom-to-mouse.lua"] + sorted((ROOT / "plugins").glob("*.lua"))
 W, H = 1280, 720
+DESKTOP_W = 2560  # the virtual X screen; the real mouse is moved on it with xdotool
 SCRIPT_SETTINGS = {
+    "obs-zoom-to-mouse.lua": {"source": "Desktop", "debug_logs": True, "click_zoom": False},
     "live-timer.lua": {"text_source": "Timer"},
     "face-mask.lua": {"webcam": "Face", "on_original": True},
     "smooth-scene-switcher.lua": {"next_transition": "Slide", "prev_transition": "Slide", "duration": 300,
@@ -120,9 +122,13 @@ def write_config(home: Path, face: Path):
              "settings": {"file": str(face)}},
             {"id": "text_ft2_source", "versioned_id": "text_ft2_source_v2", "name": "Timer",
              "settings": {"text": "..."}},
+            {"id": "xshm_input", "versioned_id": "xshm_input", "name": "Desktop",
+             "settings": {"screen": 0, "show_cursor": False}},
             {"id": "scene", "versioned_id": "scene", "name": "Main", "settings": {
-                "id_counter": 2,
+                "id_counter": 3,
                 "items": [
+                    {"name": "Desktop", "id": 3, "visible": True, "pos": {"x": 0, "y": 0},
+                     "scale": {"x": 0.5, "y": 0.5}, "align": 5},
                     {"name": "Face", "id": 1, "visible": True, "pos": {"x": 0, "y": 0},
                      "scale": {"x": 1, "y": 1}, "align": 5, "bounds_type": 2,
                      "bounds_align": 0, "bounds": {"x": W, "y": H}},
@@ -193,7 +199,7 @@ def main():
     home = Path(tempfile.mkdtemp(prefix="obs-e2e-"))
     cfg = write_config(home, face)
     env = dict(os.environ, HOME=str(home), DISPLAY=":99", LIBGL_ALWAYS_SOFTWARE="1")
-    xvfb = subprocess.Popen(["Xvfb", ":99", "-screen", "0", f"{W}x{H}x24"],
+    xvfb = subprocess.Popen(["Xvfb", ":99", "-screen", "0", f"{DESKTOP_W}x{H}x24"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1)
     obs = subprocess.Popen(["obs", "--disable-shutdown-check", "--disable-updater", "--multi"],
@@ -261,12 +267,31 @@ def main():
         if order != [("Cartoon", True), ("Face Mask", False)]:
             failures.append(f"mask off: expected Cartoon restored, got {order}")
 
-        # ---- Smooth scene switcher
-        program = lambda: o.req("GetCurrentProgramScene")["currentProgramSceneName"]
+        # ---- Zoom to Mouse on a real screen capture with the real X11 mouse
         def check(cond, msg):
             print(("  ok   " if cond else "  FAIL ") + msg)
             if not cond:
                 failures.append(msg)
+
+        subprocess.run(["xdotool", "mousemove", "1500", "100"], env=env, check=True)
+        time.sleep(0.3)
+        o.req("TriggerHotkeyByName", hotkeyName="toggle_zoom_hotkey")
+        time.sleep(1.5)
+        view = next((f for f in o.req("GetSourceFilterList", sourceName="Desktop")["filters"]
+                     if f["filterName"] == "obs-zoom-to-mouse-view"), None)
+        vs = view["filterSettings"] if view else {}
+        r = lambda k: round(vs.get(k, -1), 2)
+        # 2560x720 capture, zoom 2 -> 1280x360 view centred on (1500,100), clamped to the top
+        check(r("w") == 1280 and r("h") == 360, f"smooth zoom view 1280x360 (got {r('w')}x{r('h')})")
+        check(r("x") == 860 and r("y") == 0, f"zoom follows the real mouse (got {r('x')},{r('y')})")
+        o.req("SaveSourceScreenshot", sourceName="Desktop", imageFormat="png", imageFilePath=str(out / "zoom-smooth.png"))
+        o.req("TriggerHotkeyByName", hotkeyName="toggle_zoom_hotkey")
+        time.sleep(1.5)
+        o.req("TriggerHotkeyByName", hotkeyName="zoom_calibrate_hotkey")
+        time.sleep(0.5)
+
+        # ---- Smooth scene switcher
+        program = lambda: o.req("GetCurrentProgramScene")["currentProgramSceneName"]
 
         check(program() == "Main", "starts on Main")
         o.req("TriggerHotkeyByName", hotkeyName="smooth_switcher_next")
@@ -327,6 +352,13 @@ def main():
     log = logs[-1].read_text(errors="replace") if logs else ""
     shutil.copy(logs[-1], out / "obs.log") if logs else None
 
+    # XRandR through FFI: the calibrate hotkey must have read the real monitor
+    calib = "[zoom-to-mouse] Dùng màn hình tại 0,0 (2560x720, scale 1.00)"
+    print(("  ok   " if calib in log else "  FAIL ") + "calibrate reads the monitor from XRandR")
+    if calib not in log:
+        failures.append("calibrate hotkey did not report the 2560x720 monitor from XRandR")
+    if "Monitor (name+os): 0,0 2560x720" not in log:
+        failures.append("zoom source monitor not matched with the OS monitor list")
     for p in SCRIPTS:
         if f"Loaded lua script: {p.name}" not in log:
             failures.append(f"{p.name} did not load")

@@ -44,7 +44,7 @@ Chọn script và bấm nút **`−`**. Script nào chỉnh scene hoặc source 
 
 ---
 
-## 2. Zoom to Mouse v1.1.0
+## 2. Zoom to Mouse v1.3.0
 
 Bản fork của [BlankSourceCode/obs-zoom-to-mouse](https://github.com/BlankSourceCode/obs-zoom-to-mouse), bảo trì tại [nguyenquocanhz/zoom-to-mouse](https://github.com/nguyenquocanhz/zoom-to-mouse).
 
@@ -65,17 +65,19 @@ Bản fork của [BlankSourceCode/obs-zoom-to-mouse](https://github.com/BlankSou
 |---|---|---|
 | Zoom Factor | Mức phóng to (1–10×) | 2 cho màn 1080p, 2.5–3 cho màn 4K |
 | Zoom Step (hotkey) | Mỗi lần bấm zoom more/less thay đổi bao nhiêu | 0.5 |
-| Zoom Speed | Tốc độ animation zoom vào/ra | 0.04–0.08 |
-| **Scale filter while zoomed** | Bộ lọc phóng ảnh khi đang zoom | **Lanczos** (nét nhất) |
+| **Zoom mode** | **Smooth** (mặc định): shader dịch khung theo phần lẻ pixel + phóng bicubic, không đụng transform. **Crop**: cách cũ bằng crop filter | Smooth |
+| Zoom Speed | Tốc độ animation zoom vào/ra | 0.04–0.06 |
+| **Scale filter while zoomed** | (Chỉ chế độ Crop) Bộ lọc phóng ảnh khi đang zoom | **Lanczos** (nét nhất) |
 | **Sharpen while zoomed** | Độ làm nét, tăng dần theo mức zoom (0 = tắt) | 0.1–0.2 |
 | Auto zoom on click | Click chuột trái trong vùng màn hình thì tự zoom | Bật cho video hướng dẫn |
 | Auto zoom out after (s) | Không động chuột bao nhiêu giây thì tự zoom ra (0 = không bao giờ) | 2–4 giây |
 | Auto follow mouse | Khung tự bám chuột khi đang zoom | Bật |
-| Follow Speed | Tốc độ khung đuổi theo chuột | 0.15–0.3 |
+| Follow Speed | Độ nhanh của "lò xo" khung đuổi theo chuột (0.18 ≈ 0.17 giây để bắt kịp) | 0.12–0.25 |
 | Follow Border | Chuột vào sát mép bao nhiêu % thì khung bắt đầu chạy theo | 5–15 |
 | Lock Sensitivity | Khung chạy tới gần chuột bao nhiêu px thì đứng yên | 4 |
 | Auto Lock on reverse direction | Kéo chuột ngược lại thì khung dừng (giống kéo camera trong game RTS) | Tùy thích |
 | Allow any zoom source | Cho zoom cả source không phải Display Capture (webcam, window capture...) | Khi bật phải nhập **Set manual source position** |
+| Dùng màn hình đang có chuột | Nút (đếm 3 giây) / phím tắt: tự điền vị trí, kích thước, tỉ lệ của màn hình đang có chuột | Khi zoom lệch ở màn hình rời |
 | Set manual source position | Tự nhập vị trí và kích thước màn hình khi script không tự đoán được | Dùng khi zoom bị lệch |
 
 ### Zoom bị mờ: vì sao và cách làm nét
@@ -88,6 +90,24 @@ Khi zoom 2× trên màn 1080p, OBS cắt một vùng 960×540 rồi **phóng nó
 4. **Đừng zoom quá tay**: trên màn 1080p, 1.5–2× là hợp lý. Từ 3× trở lên chữ sẽ to nhưng vỡ.
 5. **Đủ bitrate**: lúc khung chạy theo chuột, cả hình thay đổi liên tục. Bitrate thấp thì hình bị nhòe khi chuyển động. Ghi video nên dùng CQP/CRF khoảng 18–20; stream 1080p60 nên từ 6000 Kbps.
 6. Tăng font hệ thống / zoom IDE (Ctrl + `+`) trước khi quay. Đây vẫn là cách rẻ nhất để chữ nét.
+
+### v1.3.0: zoom mượt
+
+- **Chế độ Smooth (mặc định)**: crop filter của OBS chỉ nhận số nguyên, nên khi kéo chuột chậm khung "đứng — nhảy 1 pixel — đứng" (ở 2× là nhảy 2 pixel trên hình). Giờ một filter shader riêng dịch khung theo **phần lẻ pixel** và phóng to bằng **bicubic Catmull-Rom**. Đo trong OBS thật, cùng một cú kéo chuột chậm: Crop đứng hình 27/66 lần, Smooth 0–2/65.
+- **Khung bám chuột bằng lò xo giảm chấn** (kiểu SmoothDamp) thay cho lerp: tăng tốc và giảm tốc tự nhiên, không còn vọt mạnh lúc chuột chạm mép vùng khóa, không vọt quá đích.
+- Smooth không đổi transform của source (không còn tự chuyển sang bounding box).
+- Mặc định mới: Zoom Speed 0.05, Follow Speed 0.18.
+
+### v1.2.0: sửa zoom ở màn hình rời
+
+- **Đổi Display Capture sang màn khác thì zoom lệch hẳn**: vị trí màn hình chỉ được tính một lần lúc chọn Zoom Source. Giờ được kiểm lại trước mỗi lần zoom, kể cả khi đổi sang màn cùng độ phân giải.
+- **Đổi độ phân giải hoặc sửa crop filter của Display Capture** cũng làm zoom lệch cho tới khi đổi scene. Giờ được phát hiện và thiết lập lại tự động.
+- **Màn rời có tên không đúng định dạng** (một số driver/cách capture) thì mất offset, zoom bị dồn về màn chính. Giờ dò theo danh sách màn hình của hệ điều hành.
+- **macOS**: tọa độ chuột bị lật theo chiều cao của màn đang capture thay vì màn chính, nên lệch trên màn rời khác chiều cao. Màn Retina bị nhầm point với pixel. Giờ dùng CoreGraphics cho cả chuột lẫn màn hình.
+- Hệ số scale (Retina, source bị scale) được áp **trước** khi trừ offset crop filter (trước đây làm ngược, lệch khi có crop).
+- Không còn báo nhầm `ERROR: Nguồn zoom không phải là Display Capture` lúc OBS mới khởi động.
+- **Windows, hai màn khác Scale** (vd laptop 150%, màn rời 100%): tọa độ chuột có thể bị Windows quy đổi theo DPI, lệch với pixel thật của màn rời. Giờ đọc bằng `GetPhysicalCursorPos` và đọc màn hình ở chế độ per-monitor DPI.
+- Mới: nút / phím **Dùng màn hình đang có chuột** để tự hiệu chỉnh.
 
 ### Những gì đã sửa/thêm so với v1.0.1
 
@@ -118,7 +138,17 @@ Khi zoom 2× trên màn 1080p, OBS cắt một vùng 960×540 rồi **phóng nó
 
 - **Linux Wayland**: không đọc được vị trí chuột của hệ thống. Hãy đăng nhập phiên X11 ("Ubuntu on Xorg").
 - macOS: lần đầu có thể cần cấp quyền *Accessibility / Input Monitoring* cho OBS thì auto zoom on click mới nhận click.
-- Nhiều màn hình: script đọc vị trí màn hình từ tên trong danh sách Display Capture. Nếu zoom bị lệch, bật **Set manual source position** và nhập X/Y/Width/Height của màn hình đó.
+- Nhiều màn hình: xem mục *Màn hình rời* ngay dưới.
+
+### Màn hình rời (external monitor)
+
+Từ v1.2.0 script tự lấy danh sách màn hình từ hệ điều hành (Windows: `EnumDisplayMonitors`, Linux: XRandR, macOS: CoreGraphics). Nhờ đó nó biết Display Capture đang chụp màn nào, kể cả màn đặt bên trái/phía trên màn chính (tọa độ âm), màn có độ phân giải khác, hay màn Retina trên Mac. Mỗi lần zoom, script kiểm lại xem bạn có vừa đổi Display Capture sang màn khác không.
+
+Nếu zoom ở màn rời vẫn lệch:
+1. Trong cài đặt script, bấm **Dùng màn hình đang có chuột (sau 3 giây)** rồi đưa chuột sang màn rời và để yên. Sau 3 giây script tự điền *Set manual source position* cho đúng màn đó. Kiểm tra trong **Script Log** dòng `Dùng màn hình tại X,Y (WxH, scale S)`.
+   - Hoặc gán phím **Zoom to mouse: dùng màn hình đang có chuột** trong Hotkeys, đưa chuột sang màn rời rồi bấm.
+2. Đổi Display Capture sang màn khác về sau thì bỏ tích **Set manual source position** để script tự dò lại (hoặc hiệu chỉnh lại như bước 1).
+3. Vẫn lệch: bật **Enable debug logging**, zoom một lần, rồi gửi các dòng `Monitor (...)` và `Mouse ... -> source ...` trong Script Log để kiểm tra.
 
 ---
 
@@ -336,13 +366,16 @@ tests/run.sh                    # kiểm cú pháp + chạy toàn bộ test
 python3 tests/mutate.py         # mutation test: cài lỗi vào script, test phải đỏ
 
 # Chạy trong OBS THẬT (Linux, headless): load toàn bộ script, chụp ảnh filter Cartoon Face
-sudo apt install obs-studio xvfb ffmpeg && pip install websocket-client
+sudo apt install obs-studio xvfb ffmpeg xdotool && pip install websocket-client
 python3 tests/e2e_obs.py ảnh_mặt.png out/
+python3 tests/demo_record.py out/   # quay video Zoom to Mouse: phím F9/F10/F11, di chuột, click — tất cả bằng xdotool
+ZOOM_MODE=crop python3 tests/demo_record.py out/   # cùng kịch bản ở chế độ Crop để so sánh
 ```
 
-`mutate.py` cài lại từng lỗi thật vào một bản sao script (gồm cả các lỗi của zoom-to-mouse v1.0.1 ở trên) và yêu cầu test phải **đỏ**. Mutant nào vẫn xanh nghĩa là test đang hở chỗ đó. Lượt đầu chạy có 14/42 mutant sống sót; viết thêm test cho tới khi bắt được hết thì lộ ra một lỗi thật (pomodoro trôi vài giây sau mỗi chục pha). Hiện tại 73/73 mutant đều bị bắt, kể cả mutant cài lại lỗi deadlock (mock mô phỏng luôn luật khóa của OBS).
+`mutate.py` cài lại từng lỗi thật vào một bản sao script (gồm cả các lỗi của zoom-to-mouse v1.0.1 ở trên) và yêu cầu test phải **đỏ**. Mutant nào vẫn xanh nghĩa là test đang hở chỗ đó. Lượt đầu chạy có 14/42 mutant sống sót; viết thêm test cho tới khi bắt được hết thì lộ ra một lỗi thật (pomodoro trôi vài giây sau mỗi chục pha). Hiện tại 92/92 mutant đều bị bắt, kể cả mutant cài lại lỗi deadlock (mock mô phỏng luôn luật khóa của OBS) và các lỗi màn hình rời của v1.1.0.
 
 `e2e_obs.py` mở OBS thật trên màn hình ảo (Xvfb, render bằng Mesa) và load cả 11 script. Qua obs-websocket, nó:
+- dùng `xdotool` đưa chuột thật tới một điểm trên Screen Capture (XSHM), bấm phím zoom và kiểm crop filter; bấm phím "dùng màn hình đang có chuột" để đọc màn hình qua XRandR;
 - gắn Cartoon Face và Face Mask vào ảnh mẫu, chụp ảnh từng kiểu;
 - bấm hotkey đeo mặt nạ, kiểm thứ tự filter;
 - bấm Next/Prev của Smooth Switcher, kiểm hướng Slide, thời lượng, xếp hàng, trả lại transition;
@@ -354,7 +387,7 @@ Phần đọc chuột, click, thời gian rảnh (FFI) và phím tắt vẫn c�
 
 ## Lịch sử phiên bản Zoom to Mouse
 
-v1.1.0: xem [mục 2](#2-zoom-to-mouse-v110).
+v1.3.0 (zoom mượt), v1.2.0 (màn hình rời) và v1.1.0: xem [mục 2](#2-zoom-to-mouse-v130).
 
 ### v1.0.1 (Optimized Version)
 

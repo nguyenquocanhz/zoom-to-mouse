@@ -1,5 +1,5 @@
 --[[
-    OBS Zoom to Mouse — v1.1.0
+    OBS Zoom to Mouse — v1.3.0
     Zoom a display-capture source to focus on the mouse cursor.
 
     Original script : BlankSourceCode (https://github.com/BlankSourceCode/obs-zoom-to-mouse)
@@ -22,9 +22,13 @@ local obs = obslua
 local ffi = require("ffi")
 local bit = require("bit")
 
-local VERSION = "1.1.0"
+local VERSION = "1.3.0"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 local SHARPEN_FILTER_NAME = "obs-zoom-to-mouse-sharpen"
+-- Smooth mode: our own shader filter that takes a sub-pixel view rectangle (the crop filter only
+-- takes whole pixels, which makes slow pans step 1 source pixel = 2+ screen pixels at a time)
+local VIEW_FILTER_ID = "algen_zoom_to_mouse_view"
+local VIEW_FILTER_NAME = "obs-zoom-to-mouse-view"
 local NONE_SOURCE = "obs-zoom-to-mouse-none"
 local MAX_ZOOM = 10
 
@@ -75,6 +79,7 @@ local hotkey_zoom_id = nil
 local hotkey_follow_id = nil
 local hotkey_zoom_more_id = nil
 local hotkey_zoom_less_id = nil
+local hotkey_calibrate_id = nil
 local is_timer_running = false
 
 local win_point = nil
@@ -86,6 +91,12 @@ local osx_lib = nil
 local osx_nsevent = nil
 local osx_mouse_location = nil
 local osx_pressed_buttons = nil
+local osx_cg = nil
+local win_physical_cursor = false
+local win_dpi_context = false
+local x11_randr = nil
+local script_settings = nil
+local CALIBRATE_DELAY_MS = 3000
 
 local use_auto_follow_mouse = true
 local use_follow_outside_bounds = false
@@ -99,6 +110,8 @@ local zoom_speed = 0.1
 local zoom_step = 0.5
 local use_click_zoom = false
 local auto_zoom_out_delay = 3
+local use_smooth = true
+local follow_vel = { x = 0, y = 0 }
 local scale_filter_zoomed = SCALE_LANCZOS
 local sharpen_strength = 0.1
 local allow_all_sources = false
@@ -144,8 +157,21 @@ if ffi.os == "Windows" then
         } POINT, *LPPOINT;
         BOOL GetCursorPos(LPPOINT);
         short GetAsyncKeyState(int vKey);
+
+        typedef struct { long left; long top; long right; long bottom; } RECT;
+        typedef struct { unsigned long cbSize; RECT rcMonitor; RECT rcWork; unsigned long dwFlags; } MONITORINFO;
+        typedef BOOL (__stdcall *MONITORENUMPROC)(void*, void*, RECT*, intptr_t);
+        BOOL EnumDisplayMonitors(void* hdc, const RECT* clip, MONITORENUMPROC callback, intptr_t data);
+        BOOL GetMonitorInfoA(void* monitor, MONITORINFO* info);
+        BOOL GetPhysicalCursorPos(LPPOINT);
+        void* SetThreadDpiAwarenessContext(void* context);
     ]])
     win_point = ffi.new("POINT[1]")
+    -- Monitors with different Scale (e.g. laptop 150% + external 100%): GetCursorPos can return
+    -- DPI-virtualised coordinates, while the Display Capture works in physical pixels.
+    -- GetPhysicalCursorPos (Vista+) and a per-monitor-aware thread (Win10 1607+) avoid that.
+    win_physical_cursor = pcall(function() return ffi.C.GetPhysicalCursorPos end)
+    win_dpi_context = pcall(function() return ffi.C.SetThreadDpiAwarenessContext end)
 elseif ffi.os == "Linux" then
     ffi.cdef([[
         typedef unsigned long XID;
@@ -155,6 +181,15 @@ elseif ffi.os == "Linux" then
         XID XDefaultRootWindow(Display *display);
         int XQueryPointer(Display*, Window, Window*, Window*, int*, int*, int*, int*, unsigned int*);
         int XCloseDisplay(Display*);
+
+        typedef unsigned long Atom;
+        typedef struct {
+            Atom name; int primary; int automatic; int noutput;
+            int x; int y; int width; int height; int mwidth; int mheight;
+            unsigned long *outputs;
+        } XRRMonitorInfo;
+        XRRMonitorInfo* XRRGetMonitors(Display* dpy, Window window, int get_active, int* nmonitors);
+        void XRRFreeMonitors(XRRMonitorInfo* monitors);
     ]])
 
     local ok, lib = pcall(ffi.load, "X11.so.6")
@@ -172,6 +207,10 @@ elseif ffi.os == "Linux" then
                 win_y = ffi.new("int[1]"),
                 mask = ffi.new("unsigned int[1]")
             }
+            local ok_randr, randr = pcall(ffi.load, "Xrandr.so.2")
+            if ok_randr then
+                x11_randr = randr
+            end
         else
             x11_display = nil
         end
@@ -191,7 +230,26 @@ elseif ffi.os == "OSX" then
         Method class_getClassMethod(id cls, SEL name);
         void* method_getImplementation(Method);
         int access(const char *path, int amode);
+
+        typedef uint32_t CGDirectDisplayID;
+        typedef struct { double width; double height; } CGSize;
+        typedef struct { CGPoint origin; CGSize size; } CGRect;
+        int32_t CGGetActiveDisplayList(uint32_t maxDisplays, CGDirectDisplayID* displays, uint32_t* count);
+        CGRect CGDisplayBounds(CGDirectDisplayID display);
+        void* CGDisplayCopyDisplayMode(CGDirectDisplayID display);
+        size_t CGDisplayModeGetPixelWidth(void* mode);
+        void CGDisplayModeRelease(void* mode);
+        void* CGEventCreate(void* source);
+        CGPoint CGEventGetLocation(void* event);
+        void CFRelease(const void* cf);
     ]])
+
+    -- CoreGraphics gives the mouse and every display in one coordinate system
+    -- (points, origin at the top-left of the main display), which works for external monitors
+    local ok_cg, cg = pcall(ffi.load, "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    if ok_cg then
+        osx_cg = cg
+    end
 
     local ok, lib = pcall(ffi.load, "libobjc")
     if ok then
@@ -239,7 +297,10 @@ function get_mouse_pos()
     local mouse = { x = 0, y = 0 }
 
     if ffi.os == "Windows" then
-        if win_point and ffi.C.GetCursorPos(win_point) ~= 0 then
+        if win_point and win_physical_cursor and ffi.C.GetPhysicalCursorPos(win_point) ~= 0 then
+            mouse.x = win_point[0].x
+            mouse.y = win_point[0].y
+        elseif win_point and ffi.C.GetCursorPos(win_point) ~= 0 then
             mouse.x = win_point[0].x
             mouse.y = win_point[0].y
         end
@@ -249,7 +310,16 @@ function get_mouse_pos()
             mouse.y = tonumber(x11_mouse.win_y[0])
         end
     elseif ffi.os == "OSX" then
-        if osx_mouse_location ~= nil then
+        if osx_cg ~= nil then
+            local event = osx_cg.CGEventCreate(nil)
+            if event ~= nil then
+                local point = osx_cg.CGEventGetLocation(event)
+                osx_cg.CFRelease(event)
+                mouse.x = point.x
+                mouse.y = point.y
+            end
+        elseif osx_mouse_location ~= nil then
+            -- Fallback: NSEvent has its origin at the bottom-left of the main display
             local point = osx_mouse_location(osx_nsevent.class, osx_nsevent.sel)
             mouse.x = point.x
             if monitor_info ~= nil then
@@ -380,6 +450,130 @@ end
 
 ---
 -- Get the size and position of the monitor so that we know the top-left mouse point
+---
+-- Every monitor as the OS sees it, in the same coordinates as get_mouse_pos().
+-- scale = source pixels per mouse unit (2 on a Retina display, else 1).
+---@return table list of { x, y, width, height, scale, primary }
+function get_monitor_rects()
+    local rects = {}
+
+    if ffi.os == "Windows" then
+        local ok = pcall(function()
+            local cb = ffi.cast("MONITORENUMPROC", function(hmon, hdc, rect, data)
+                local mi = ffi.new("MONITORINFO")
+                mi.cbSize = ffi.sizeof("MONITORINFO")
+                if ffi.C.GetMonitorInfoA(hmon, mi) ~= 0 then
+                    local r = mi.rcMonitor
+                    table.insert(rects, {
+                        x = tonumber(r.left), y = tonumber(r.top),
+                        width = tonumber(r.right - r.left), height = tonumber(r.bottom - r.top),
+                        scale = 1, primary = bit.band(tonumber(mi.dwFlags), 1) ~= 0
+                    })
+                end
+                return 1
+            end)
+            -- Physical pixels for every monitor, whatever its Scale setting (-4 = PER_MONITOR_AWARE_V2)
+            local old_ctx = nil
+            if win_dpi_context then
+                old_ctx = ffi.C.SetThreadDpiAwarenessContext(ffi.cast("void*", -4))
+            end
+            ffi.C.EnumDisplayMonitors(nil, nil, cb, 0)
+            if old_ctx ~= nil then
+                ffi.C.SetThreadDpiAwarenessContext(old_ctx)
+            end
+            cb:free()
+        end)
+        if not ok then
+            rects = {}
+        end
+    elseif ffi.os == "Linux" then
+        if x11_randr ~= nil and x11_display ~= nil then
+            local n = ffi.new("int[1]")
+            local mons = x11_randr.XRRGetMonitors(x11_display, x11_root, 1, n)
+            if mons ~= nil then
+                for i = 0, n[0] - 1 do
+                    local m = mons[i]
+                    table.insert(rects, {
+                        x = m.x, y = m.y, width = m.width, height = m.height,
+                        scale = 1, primary = m.primary ~= 0
+                    })
+                end
+                x11_randr.XRRFreeMonitors(mons)
+            end
+        end
+    elseif ffi.os == "OSX" then
+        if osx_cg ~= nil then
+            local ids = ffi.new("CGDirectDisplayID[16]")
+            local count = ffi.new("uint32_t[1]")
+            if osx_cg.CGGetActiveDisplayList(16, ids, count) == 0 then
+                for i = 0, count[0] - 1 do
+                    local b = osx_cg.CGDisplayBounds(ids[i])
+                    local scale = 1
+                    local mode = osx_cg.CGDisplayCopyDisplayMode(ids[i])
+                    if mode ~= nil then
+                        local pw = tonumber(osx_cg.CGDisplayModeGetPixelWidth(mode))
+                        osx_cg.CGDisplayModeRelease(mode)
+                        if b.size.width > 0 and pw > 0 then
+                            scale = pw / b.size.width
+                        end
+                    end
+                    table.insert(rects, {
+                        x = b.origin.x, y = b.origin.y, width = b.size.width, height = b.size.height,
+                        scale = scale, primary = b.origin.x == 0 and b.origin.y == 0
+                    })
+                end
+            end
+        end
+    end
+
+    return rects
+end
+
+function info_from_rect(r)
+    return {
+        x = r.x, y = r.y,
+        width = math.floor(r.width * r.scale + 0.5), height = math.floor(r.height * r.scale + 0.5),
+        scale_x = r.scale, scale_y = r.scale,
+        display_width = r.width, display_height = r.height
+    }
+end
+
+---
+-- Decide which monitor a display capture shows.
+--   parsed      : position/size read from the capture's monitor name, or nil
+--   rects       : get_monitor_rects()
+--   src_w/src_h : capture size in pixels
+--   trust_parsed: names are in desktop pixels (Windows/Linux) — use them even without a matching rect
+---@return table|nil monitor info, string how it was found
+function pick_monitor(parsed, rects, src_w, src_h, trust_parsed)
+    if parsed ~= nil then
+        for _, r in ipairs(rects) do
+            if math.abs(r.x - parsed.x) <= 2 and math.abs(r.y - parsed.y) <= 2 then
+                return info_from_rect(r), "name+os"
+            end
+        end
+        if trust_parsed or #rects == 0 then
+            return parsed, "name"
+        end
+    end
+
+    -- No usable name: the monitor whose pixel size matches the capture
+    local hits = {}
+    for _, r in ipairs(rects) do
+        if math.abs(r.width * r.scale - src_w) <= 2 and math.abs(r.height * r.scale - src_h) <= 2 then
+            table.insert(hits, r)
+        end
+    end
+    if #hits == 1 then
+        return info_from_rect(hits[1]), "size"
+    end
+    if #hits > 1 then
+        log("WARNING: " .. #hits .. " màn hình cùng độ phân giải " .. src_w .. "x" .. src_h ..
+            " — không biết capture màn nào. Đưa chuột sang màn đó và dùng 'Dùng màn hình đang có chuột'.")
+    end
+    return parsed, "none"
+end
+
 ---@param source any The OBS source
 ---@return table|nil monitor_info The monitor size/top-left point
 function get_monitor_info(source)
@@ -449,6 +643,17 @@ function get_monitor_info(source)
                 obs.obs_properties_destroy(props)
             end
         end
+
+        -- Check the name against the monitors the OS reports (fixes external monitors whose name
+        -- can't be parsed, and Retina scaling on macOS)
+        local src_w = obs.obs_source_get_base_width(source)
+        local src_h = obs.obs_source_get_base_height(source)
+        local how
+        info, how = pick_monitor(info, get_monitor_rects(), src_w, src_h, ffi.os ~= "OSX")
+        if info ~= nil then
+            log("Monitor (" .. how .. "): " .. info.x .. "," .. info.y .. " " .. info.width .. "x" .. info.height ..
+                " scale " .. info.scale_x)
+        end
     end
 
     if use_monitor_override then
@@ -483,6 +688,183 @@ function is_display_capture(source_to_check)
 
     local dc_info = get_dc_info()
     return dc_info ~= nil and obs.obs_source_get_id(source_to_check) == dc_info.source_id
+end
+
+------------------------------------------------------------------------------
+-- Smooth zoom filter: samples the source at a floating-point view rectangle with Catmull-Rom
+-- bicubic interpolation, so panning is sub-pixel smooth and the upscale stays sharp.
+
+local VIEW_EFFECT = [==[
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 tex_size;
+uniform float4 view;
+
+sampler_state def_sampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+    VertData vert_out;
+    vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    vert_out.uv  = v_in.uv;
+    return vert_out;
+}
+
+float4 tap(float2 px)
+{
+    return image.Sample(def_sampler, px / tex_size);
+}
+
+// Catmull-Rom bicubic in 9 bilinear taps
+float4 bicubic(float2 px)
+{
+    float2 p1 = floor(px - 0.5) + 0.5;
+    float2 f = px - p1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 p0 = p1 - 1.0;
+    float2 p3 = p1 + 2.0;
+    float2 p12 = p1 + w2 / w12;
+    float4 c = tap(float2(p0.x, p0.y)) * w0.x * w0.y
+             + tap(float2(p12.x, p0.y)) * w12.x * w0.y
+             + tap(float2(p3.x, p0.y)) * w3.x * w0.y
+             + tap(float2(p0.x, p12.y)) * w0.x * w12.y
+             + tap(float2(p12.x, p12.y)) * w12.x * w12.y
+             + tap(float2(p3.x, p12.y)) * w3.x * w12.y
+             + tap(float2(p0.x, p3.y)) * w0.x * w3.y
+             + tap(float2(p12.x, p3.y)) * w12.x * w3.y
+             + tap(float2(p3.x, p3.y)) * w3.x * w3.y;
+    return saturate(c);
+}
+
+float4 PSZoom(VertData v_in) : TARGET
+{
+    return bicubic(view.xy + v_in.uv * view.zw);
+}
+
+technique Draw
+{
+    pass
+    {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSZoom(v_in);
+    }
+}
+]==]
+
+local view_filter = {}
+view_filter.id = VIEW_FILTER_ID
+view_filter.type = obs.OBS_SOURCE_TYPE_FILTER
+view_filter.output_flags = obs.OBS_SOURCE_VIDEO
+
+view_filter.get_name = function()
+    return "Zoom to Mouse (smooth view)"
+end
+
+view_filter.create = function(settings, src)
+    local data = { source = src, tex_size = obs.vec2(), view = obs.vec4(), x = 0, y = 0, w = 0, h = 0 }
+    obs.obs_enter_graphics()
+    data.effect = obs.gs_effect_create(VIEW_EFFECT, "zoom_to_mouse_view.effect", nil)
+    if data.effect ~= nil then
+        data.p_tex = obs.gs_effect_get_param_by_name(data.effect, "tex_size")
+        data.p_view = obs.gs_effect_get_param_by_name(data.effect, "view")
+    end
+    obs.obs_leave_graphics()
+    if data.effect == nil then
+        obs.script_log(obs.OBS_LOG_ERROR, "[zoom-to-mouse] Smooth zoom shader failed to compile, use Zoom mode: Crop")
+        return nil
+    end
+    view_filter.update(data, settings)
+    return data
+end
+
+view_filter.destroy = function(data)
+    if data.effect ~= nil then
+        obs.obs_enter_graphics()
+        obs.gs_effect_destroy(data.effect)
+        obs.obs_leave_graphics()
+        data.effect = nil
+    end
+end
+
+-- A Lua filter without get_width/get_height is 0x0 to OBS (the whole source disappears),
+-- so report the input size, read once per frame in video_tick
+view_filter.video_tick = function(data, seconds)
+    local target = obs.obs_filter_get_target(data.source)
+    data.tw = target and obs.obs_source_get_base_width(target) or 0
+    data.th = target and obs.obs_source_get_base_height(target) or 0
+end
+
+view_filter.get_width = function(data)
+    return data.tw or 0
+end
+
+view_filter.get_height = function(data)
+    return data.th or 0
+end
+
+view_filter.update = function(data, settings)
+    data.x = obs.obs_data_get_double(settings, "x")
+    data.y = obs.obs_data_get_double(settings, "y")
+    data.w = obs.obs_data_get_double(settings, "w")
+    data.h = obs.obs_data_get_double(settings, "h")
+end
+
+view_filter.video_render = function(data, effect)
+    local tw, th = data.tw or 0, data.th or 0
+    -- Not zoomed (or no size yet): pass the picture through untouched
+    if tw == 0 or th == 0 or data.w <= 0 or data.h <= 0 or
+        (data.w >= tw - 0.01 and data.h >= th - 0.01 and math.abs(data.x) < 0.01 and math.abs(data.y) < 0.01) then
+        obs.obs_source_skip_video_filter(data.source)
+        return
+    end
+    if not obs.obs_source_process_filter_begin(data.source, obs.GS_RGBA, obs.OBS_NO_DIRECT_RENDERING) then
+        return
+    end
+    data.tex_size.x, data.tex_size.y = tw, th
+    data.view.x, data.view.y, data.view.z, data.view.w = data.x, data.y, data.w, data.h
+    obs.gs_effect_set_vec2(data.p_tex, data.tex_size)
+    obs.gs_effect_set_vec4(data.p_view, data.view)
+    obs.obs_source_process_filter_end(data.source, data.effect, tw, th)
+end
+
+obs.obs_register_source(view_filter)
+
+---
+-- Critically damped spring (same idea as Unity's SmoothDamp): eases in AND out, never overshoots.
+---@return number position, number velocity
+function smooth_damp(current, target, velocity, smooth_time, dt)
+    local omega = 2 / math.max(0.0001, smooth_time)
+    local x = omega * dt
+    local decay = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
+    local change = current - target
+    local temp = (velocity + omega * change) * dt
+    local new_velocity = (velocity - omega * temp) * decay
+    local out = target + (change + temp) * decay
+    -- Don't overshoot the target
+    if (target - current > 0) == (out > target) then
+        out = target
+        new_velocity = 0
+    end
+    return out, new_velocity
+end
+
+---
+-- Follow Speed (0.01 - 1) as the spring's smoothing time: 0.25 -> 0.12 s, 0.1 -> 0.3 s
+function follow_smooth_time()
+    return clamp(0.03, 1.0, 0.03 / math.max(0.01, follow_speed))
 end
 
 function start_timer()
@@ -654,9 +1036,13 @@ function refresh_sceneitem(find_newest)
         end
     end
 
-    if not monitor_info then
-        monitor_info = get_monitor_info(source)
+    -- Nothing to set up yet (e.g. the script loads before OBS has created the sources)
+    if source == nil then
+        return
     end
+
+    -- Always re-read: the capture may have been switched to another monitor since last time
+    monitor_info = get_monitor_info(source)
 
     local is_non_display_capture = not is_display_capture(source)
     if is_non_display_capture and not use_monitor_override then
@@ -695,6 +1081,8 @@ function refresh_sceneitem(find_newest)
     -- Get the current source size (this will be the value after any applied crop filters)
     local source_width = obs.obs_source_get_base_width(source)
     local source_height = obs.obs_source_get_base_height(source)
+    zoom_info.base_w, zoom_info.base_h = source_width, source_height
+    zoom_info.crop_sig = user_crop_signature(source)
 
     if source_width == 0 then
         source_width = source_raw.width
@@ -715,8 +1103,9 @@ function refresh_sceneitem(find_newest)
         log("Using source size: " .. source_width .. ", " .. source_height)
     end
 
-    -- Convert the current transform into a bounding box one that we can modify for zooming
-    if sceneitem_info.bounds_type == obs.OBS_BOUNDS_NONE then
+    -- Crop mode changes the source size, so the transform must scale into a bounding box.
+    -- Smooth mode keeps the size, so the user's transform is left alone.
+    if not use_smooth and sceneitem_info.bounds_type == obs.OBS_BOUNDS_NONE then
         sceneitem_info.bounds_type = obs.OBS_BOUNDS_SCALE_INNER
         sceneitem_info.bounds_alignment = 5 -- (5 == OBS_ALIGN_TOP | OBS_ALIGN_LEFT)
         sceneitem_info.bounds.x = source_width * sceneitem_info.scale.x
@@ -802,12 +1191,24 @@ function refresh_sceneitem(find_newest)
     crop_filter_info_orig = { x = 0, y = 0, w = source_width, h = source_height }
     crop_filter_info = { x = 0, y = 0, w = source_width, h = source_height }
 
-    -- Get or create our crop filter that we change during zoom
-    crop_filter = obs.obs_source_get_filter_by_name(source, CROP_FILTER_NAME)
+    -- Leftover zoom filter from the other mode (e.g. OBS crashed while zoomed): remove it
+    local stale = obs.obs_source_get_filter_by_name(source, use_smooth and CROP_FILTER_NAME or VIEW_FILTER_NAME)
+    if stale ~= nil then
+        obs.obs_source_filter_remove(source, stale)
+        obs.obs_source_release(stale)
+    end
+
+    -- Get or create our zoom filter that we change during zoom
+    local filter_name = use_smooth and VIEW_FILTER_NAME or CROP_FILTER_NAME
+    crop_filter = obs.obs_source_get_filter_by_name(source, filter_name)
     if crop_filter == nil then
         crop_filter_settings = obs.obs_data_create()
-        obs.obs_data_set_bool(crop_filter_settings, "relative", false)
-        crop_filter = obs.obs_source_create_private("crop_filter", CROP_FILTER_NAME, crop_filter_settings)
+        if use_smooth then
+            crop_filter = obs.obs_source_create_private(VIEW_FILTER_ID, filter_name, crop_filter_settings)
+        else
+            obs.obs_data_set_bool(crop_filter_settings, "relative", false)
+            crop_filter = obs.obs_source_create_private("crop_filter", filter_name, crop_filter_settings)
+        end
         obs.obs_source_filter_add(source, crop_filter)
     else
         crop_filter_settings = obs.obs_source_get_settings(crop_filter)
@@ -815,6 +1216,7 @@ function refresh_sceneitem(find_newest)
 
     obs.obs_source_filter_set_order(source, crop_filter, obs.OBS_ORDER_MOVE_BOTTOM)
     crop_last_applied.x = -1 -- force the first update through
+    follow_vel.x, follow_vel.y = 0, 0
     set_crop_settings(crop_filter_info_orig)
 end
 
@@ -848,15 +1250,16 @@ function get_mouse_in_source(zoom)
         mouse.y = mouse.y - monitor_info.y
     end
 
-    -- Offset by any crop filter so a 100px crop makes 100,0 become 0,0
-    mouse.x = mouse.x - zoom.source_crop_filter.x
-    mouse.y = mouse.y - zoom.source_crop_filter.y
-
-    -- Cloned / scaled sources need the mouse movement scaled to match
+    -- Mouse units -> source pixels (Retina = 2, cloned / scaled sources). This must happen before
+    -- the crop offset, which is already in source pixels.
     if monitor_info and monitor_info.scale_x and monitor_info.scale_y then
         mouse.x = mouse.x * monitor_info.scale_x
         mouse.y = mouse.y * monitor_info.scale_y
     end
+
+    -- Offset by any crop filter so a 100px crop makes 100,0 become 0,0
+    mouse.x = mouse.x - zoom.source_crop_filter.x
+    mouse.y = mouse.y - zoom.source_crop_filter.y
 
     return mouse
 end
@@ -882,8 +1285,12 @@ function get_target_position(zoom)
     }
 
     -- Keep the zoom inside the source so we never show something the user is hiding with a crop
-    crop.x = math.floor(clamp(0, (zoom.source_size.width - new_size.width), crop.x))
-    crop.y = math.floor(clamp(0, (zoom.source_size.height - new_size.height), crop.y))
+    crop.x = clamp(0, (zoom.source_size.width - new_size.width), crop.x)
+    crop.y = clamp(0, (zoom.source_size.height - new_size.height), crop.y)
+    if not use_smooth then
+        crop.x = math.floor(crop.x)
+        crop.y = math.floor(crop.y)
+    end
 
     return {
         crop = crop,
@@ -895,11 +1302,55 @@ end
 ---
 -- Start an animation from the current crop to the target
 function begin_animation(state, target)
+    follow_vel.x, follow_vel.y = 0, 0
     zoom_state = state
     zoom_time = 0
     zoom_target = target
     anim_from = { x = crop_filter_info.x, y = crop_filter_info.y, w = crop_filter_info.w, h = crop_filter_info.h }
     start_timer()
+end
+
+---
+-- The user's own crop/pad filters on the capture, as a comparable string
+function user_crop_signature(src)
+    local parts = {}
+    local filters = obs.obs_source_enum_filters(src)
+    if filters ~= nil then
+        for _, f in ipairs(filters) do
+            local name = obs.obs_source_get_name(f)
+            if obs.obs_source_get_id(f) == "crop_filter" and name ~= CROP_FILTER_NAME
+                and name ~= "temp_" .. CROP_FILTER_NAME then
+                local st = obs.obs_source_get_settings(f)
+                table.insert(parts, table.concat({ name, tostring(obs.obs_source_enabled(f)),
+                    tostring(obs.obs_data_get_bool(st, "relative")),
+                    obs.obs_data_get_int(st, "left"), obs.obs_data_get_int(st, "top"),
+                    obs.obs_data_get_int(st, "cx"), obs.obs_data_get_int(st, "cy") }, ":"))
+                obs.obs_data_release(st)
+            end
+        end
+        obs.source_list_release(filters)
+    end
+    return table.concat(parts, "|")
+end
+
+---
+-- Before zooming in from the normal view: pick up a capture that was switched to another monitor,
+-- changed resolution, or got its crop filters edited since the scene was set up.
+---@return boolean ok still have a sceneitem to zoom
+function sync_with_capture()
+    if zoom_state ~= ZoomState.None or sceneitem == nil or source == nil then
+        return sceneitem ~= nil
+    end
+    local w = obs.obs_source_get_base_width(source)
+    local h = obs.obs_source_get_base_height(source)
+    if w ~= zoom_info.base_w or h ~= zoom_info.base_h or user_crop_signature(source) ~= zoom_info.crop_sig then
+        log("Capture changed (" .. tostring(zoom_info.base_w) .. "x" .. tostring(zoom_info.base_h) ..
+            " -> " .. w .. "x" .. h .. " or crop filters), refreshing")
+        refresh_sceneitem(true)
+    elseif not use_monitor_override then
+        monitor_info = get_monitor_info(source)
+    end
+    return sceneitem ~= nil
 end
 
 function start_zoom_in(by_click)
@@ -909,7 +1360,15 @@ function start_zoom_in(by_click)
     locked_last_pos = nil
     zoomed_by_click = by_click and true or false
     last_activity = now_sec()
-    begin_animation(ZoomState.ZoomingIn, get_target_position(zoom_info))
+    local target = get_target_position(zoom_info)
+    if debug_logs then
+        local m = get_mouse_pos()
+        log("Mouse " .. m.x .. "," .. m.y .. " -> source " .. math.floor(target.raw_center.x) .. "," ..
+            math.floor(target.raw_center.y) .. " (source " .. zoom_info.source_size.width .. "x" ..
+            zoom_info.source_size.height .. ", monitor " .. (monitor_info and (monitor_info.x .. "," .. monitor_info.y)
+            or "?") .. ")")
+    end
+    begin_animation(ZoomState.ZoomingIn, target)
 end
 
 function start_zoom_out()
@@ -950,7 +1409,7 @@ function on_toggle_zoom(pressed)
     -- Pressing during an animation reverses it from wherever it currently is
     if zoom_state == ZoomState.ZoomedIn or zoom_state == ZoomState.ZoomingIn then
         start_zoom_out()
-    else
+    elseif sync_with_capture() then
         start_zoom_in(false)
     end
 end
@@ -973,6 +1432,57 @@ function change_zoom_level(delta)
     zoom_info.zoom_to = zoom_value
     locked_center = nil
     begin_animation(ZoomState.ZoomingIn, get_target_position(zoom_info))
+end
+
+---
+-- "Dùng màn hình đang có chuột": take the monitor under the cursor as the zoom source's monitor and
+-- store it as the manual position, so it also survives restarts.
+function calibrate_monitor()
+    local m = get_mouse_pos()
+    for _, r in ipairs(get_monitor_rects()) do
+        if m.x >= r.x and m.x < r.x + r.width and m.y >= r.y and m.y < r.y + r.height then
+            local info = info_from_rect(r)
+            use_monitor_override = true
+            monitor_override_x = math.floor(r.x + 0.5)
+            monitor_override_y = math.floor(r.y + 0.5)
+            monitor_override_w = info.width
+            monitor_override_h = info.height
+            monitor_override_sx = r.scale
+            monitor_override_sy = r.scale
+            monitor_override_dw = math.floor(r.width + 0.5)
+            monitor_override_dh = math.floor(r.height + 0.5)
+            if script_settings ~= nil then
+                obs.obs_data_set_bool(script_settings, "use_monitor_override", true)
+                obs.obs_data_set_int(script_settings, "monitor_override_x", monitor_override_x)
+                obs.obs_data_set_int(script_settings, "monitor_override_y", monitor_override_y)
+                obs.obs_data_set_int(script_settings, "monitor_override_w", monitor_override_w)
+                obs.obs_data_set_int(script_settings, "monitor_override_h", monitor_override_h)
+                obs.obs_data_set_double(script_settings, "monitor_override_sx", r.scale)
+                obs.obs_data_set_double(script_settings, "monitor_override_sy", r.scale)
+                obs.obs_data_set_int(script_settings, "monitor_override_dw", monitor_override_dw)
+                obs.obs_data_set_int(script_settings, "monitor_override_dh", monitor_override_dh)
+            end
+            monitor_info = get_monitor_info(source)
+            obs.script_log(obs.OBS_LOG_INFO, string.format(
+                "[zoom-to-mouse] Dùng màn hình tại %d,%d (%dx%d, scale %.2f) cho Zoom Source",
+                monitor_override_x, monitor_override_y, info.width, info.height, r.scale))
+            return true
+        end
+    end
+    obs.script_log(obs.OBS_LOG_WARNING, "[zoom-to-mouse] Không đọc được danh sách màn hình từ hệ điều hành " ..
+        "— hãy nhập 'Set manual source position' bằng tay")
+    return false
+end
+
+function on_calibrate(pressed)
+    if pressed then
+        calibrate_monitor()
+    end
+end
+
+function on_calibrate_timer()
+    obs.timer_remove(on_calibrate_timer)
+    calibrate_monitor()
 end
 
 function on_zoom_more(pressed)
@@ -1026,13 +1536,20 @@ function update_follow(frames)
     end
 
     if locked_center == nil and (zoom_target.crop.x ~= crop_filter_info.x or zoom_target.crop.y ~= crop_filter_info.y) then
-        -- Same feel as a per-frame lerp at 60fps, but independent of the OBS frame rate
-        local t = 1 - math.pow(1 - follow_speed, frames)
-        crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, t)
-        crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, t)
-        -- Snap the last half pixel, otherwise the lerp never reaches the edge and floor() leaves it 1px short
-        if math.abs(crop_filter_info.x - zoom_target.crop.x) < 0.5 then crop_filter_info.x = zoom_target.crop.x end
-        if math.abs(crop_filter_info.y - zoom_target.crop.y) < 0.5 then crop_filter_info.y = zoom_target.crop.y end
+        -- Spring instead of a plain lerp: the view accelerates and decelerates smoothly instead of
+        -- jumping to full speed the moment the mouse reaches the edge. Frame-rate independent.
+        local dt = frames / 60
+        local st = follow_smooth_time()
+        crop_filter_info.x, follow_vel.x = smooth_damp(crop_filter_info.x, zoom_target.crop.x, follow_vel.x, st, dt)
+        crop_filter_info.y, follow_vel.y = smooth_damp(crop_filter_info.y, zoom_target.crop.y, follow_vel.y, st, dt)
+        -- Snap the last bit, otherwise floor() (crop mode) leaves the view 1px short of the edge
+        local snap = use_smooth and 0.05 or 0.5
+        if math.abs(crop_filter_info.x - zoom_target.crop.x) < snap then
+            crop_filter_info.x, follow_vel.x = zoom_target.crop.x, 0
+        end
+        if math.abs(crop_filter_info.y - zoom_target.crop.y) < snap then
+            crop_filter_info.y, follow_vel.y = zoom_target.crop.y, 0
+        end
         set_crop_settings(crop_filter_info)
 
         -- Check to see if the mouse has stopped moving long enough to create a new safe zone
@@ -1136,11 +1653,28 @@ function set_crop_settings(crop)
         return
     end
 
+    local last = crop_last_applied
+    if use_smooth then
+        -- Sub-pixel view: only skip changes too small to see (1/100 px)
+        local x, y, w, h = crop.x, crop.y, crop.w, crop.h
+        if math.abs(last.x - x) < 0.01 and math.abs(last.y - y) < 0.01 and
+            math.abs(last.w - w) < 0.01 and math.abs(last.h - h) < 0.01 then
+            return
+        end
+        last.x, last.y, last.w, last.h = x, y, w, h
+        obs.obs_data_set_double(crop_filter_settings, "x", x)
+        obs.obs_data_set_double(crop_filter_settings, "y", y)
+        obs.obs_data_set_double(crop_filter_settings, "w", w)
+        obs.obs_data_set_double(crop_filter_settings, "h", h)
+        obs.obs_source_update(crop_filter, crop_filter_settings)
+        update_zoom_quality(w)
+        return
+    end
+
     local x = math.floor(crop.x)
     local y = math.floor(crop.y)
     local w = math.floor(crop.w)
     local h = math.floor(crop.h)
-    local last = crop_last_applied
     if last.x == x and last.y == y and last.w == w and last.h == h then
         return
     end
@@ -1197,7 +1731,8 @@ function update_zoom_quality(crop_w)
     local ratio = crop_filter_info_orig.w / crop_w
     local zoomed = ratio > 1.001
 
-    if scale_filter_orig ~= nil then
+    -- In smooth mode our shader does the (bicubic) upscale and OBS never scales the item
+    if scale_filter_orig ~= nil and not use_smooth then
         local want = scale_filter_orig
         if zoomed and scale_filter_zoomed ~= SCALE_KEEP then
             want = scale_filter_zoomed
@@ -1262,7 +1797,7 @@ function on_mouse_click()
     if zoom_state ~= ZoomState.None and zoom_state ~= ZoomState.ZoomingOut then
         return
     end
-    if not ensure_sceneitem() then
+    if not ensure_sceneitem() or not sync_with_capture() then
         return
     end
 
@@ -1319,6 +1854,10 @@ function on_settings_modified(props, prop, settings)
             obs.obs_property_set_visible(obs.obs_properties_get(props, p), visible)
         end
         return true
+    elseif name == "zoom_mode" then
+        obs.obs_property_set_visible(obs.obs_properties_get(props, "scale_filter"),
+            obs.obs_data_get_string(settings, "zoom_mode") == "crop")
+        return true
     elseif name == "click_zoom" then
         obs.obs_property_set_visible(obs.obs_properties_get(props, "auto_zoom_out_delay"),
             obs.obs_data_get_bool(settings, "click_zoom"))
@@ -1343,6 +1882,7 @@ function log_current_settings()
     local settings = {
         zoom_value = zoom_value,
         zoom_speed = zoom_speed,
+        use_smooth = use_smooth,
         zoom_step = zoom_step,
         use_click_zoom = use_click_zoom,
         auto_zoom_out_delay = auto_zoom_out_delay,
@@ -1381,6 +1921,7 @@ function on_print_help()
         "Zoom Factor: How much to zoom in by\n" ..
         "Zoom Step: How much the 'Zoom in more/less' hotkeys change the zoom factor\n" ..
         "Zoom Speed: The speed of the zoom in/out animation (frame-rate independent)\n" ..
+        "Zoom mode: Smooth (sub-pixel shader + bicubic, default) or Crop (classic crop filter)\n" ..
         "Scale filter while zoomed: Lanczos/Bicubic keep the zoomed image sharper than bilinear\n" ..
         "Sharpen while zoomed: Strength of a Sharpen filter that fades in with the zoom (0 = off)\n" ..
         "Auto zoom on click: Left click inside the source zooms in automatically\n" ..
@@ -1393,6 +1934,7 @@ function on_print_help()
         "Auto Lock on reverse direction: Automatically stop tracking if you reverse the direction of the mouse\n" ..
         "Allow any zoom source: Any source can be the Zoom Source - you MUST set manual source position for it\n" ..
         "Set manual source position: Override x/y, width/height and scale for the selected source\n" ..
+        "Dùng màn hình đang có chuột: auto-fill the manual position from the monitor under the cursor\n" ..
         "More Info: Show this text in the script log\n" ..
         "Enable debug logging: Show additional debug information in the script log\n\n" ..
         "Hotkeys (Settings > Hotkeys): Toggle zoom to mouse, Toggle follow mouse during zoom,\n" ..
@@ -1435,6 +1977,15 @@ function script_properties()
     obs.obs_property_set_long_description(delay,
         "Zoom back out after this many seconds without mouse activity (0 = never). Only for click zooms.")
 
+    local mode = obs.obs_properties_add_list(props, "zoom_mode", "Zoom mode",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(mode, "Smooth — sub-pixel + bicubic (recommended)", "smooth")
+    obs.obs_property_list_add_string(mode, "Crop filter (classic)", "crop")
+    obs.obs_property_set_long_description(mode,
+        "Smooth: a shader moves the view by fractions of a pixel and upscales with bicubic — no stepping " ..
+        "when panning slowly, and your transform is left untouched. Crop: the original crop-filter method.")
+    obs.obs_property_set_modified_callback(mode, on_settings_modified)
+
     local scale = obs.obs_properties_add_list(props, "scale_filter", "Scale filter while zoomed",
         obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
     obs.obs_property_list_add_int(scale, "Lanczos (sharpest)", SCALE_LANCZOS)
@@ -1467,6 +2018,17 @@ function script_properties()
     local allow_all = obs.obs_properties_add_bool(props, "allow_all_sources", "Allow any zoom source ")
     obs.obs_property_set_long_description(allow_all, "Enable to allow selecting any source as the Zoom Source\n" ..
         "You MUST set manual source position for non-display capture sources")
+
+    local calib = obs.obs_properties_add_button(props, "calibrate", "Dùng màn hình đang có chuột (sau 3 giây)",
+        function()
+            obs.script_log(obs.OBS_LOG_INFO, "[zoom-to-mouse] Đưa chuột sang màn hình cần zoom trong 3 giây...")
+            obs.timer_remove(on_calibrate_timer)
+            obs.timer_add(on_calibrate_timer, CALIBRATE_DELAY_MS)
+            return false
+        end)
+    obs.obs_property_set_long_description(calib,
+        "Bấm rồi đưa chuột sang màn hình mà Zoom Source đang capture (vd màn rời). Sau 3 giây script tự lấy " ..
+        "vị trí, kích thước, tỉ lệ của màn đó và điền vào 'Set manual source position'.")
 
     local override = obs.obs_properties_add_bool(props, "use_monitor_override", "Set manual source position ")
     obs.obs_property_set_long_description(override,
@@ -1512,6 +2074,7 @@ function read_settings(settings)
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
     zoom_step = obs.obs_data_get_double(settings, "zoom_step")
     zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    use_smooth = obs.obs_data_get_string(settings, "zoom_mode") ~= "crop"
     use_click_zoom = obs.obs_data_get_bool(settings, "click_zoom")
     auto_zoom_out_delay = obs.obs_data_get_double(settings, "auto_zoom_out_delay")
     scale_filter_zoomed = obs.obs_data_get_int(settings, "scale_filter")
@@ -1540,12 +2103,15 @@ local HOTKEYS = {
     { id = "toggle_follow_hotkey", desc = "Toggle follow mouse during zoom", save = "obs_zoom_to_mouse.hotkey.follow" },
     { id = "zoom_more_hotkey", desc = "Zoom to mouse: zoom in more", save = "obs_zoom_to_mouse.hotkey.zoom_more" },
     { id = "zoom_less_hotkey", desc = "Zoom to mouse: zoom in less", save = "obs_zoom_to_mouse.hotkey.zoom_less" },
+    { id = "zoom_calibrate_hotkey", desc = "Zoom to mouse: dùng màn hình đang có chuột",
+      save = "obs_zoom_to_mouse.hotkey.calibrate" },
 }
 
 function script_load(settings)
     sceneitem_info_orig = nil
 
-    local callbacks = { on_toggle_zoom, on_toggle_follow, on_zoom_more, on_zoom_less }
+    script_settings = settings
+    local callbacks = { on_toggle_zoom, on_toggle_follow, on_zoom_more, on_zoom_less, on_calibrate }
     local ids = {}
     for i, hk in ipairs(HOTKEYS) do
         ids[i] = obs.obs_hotkey_register_frontend(hk.id, hk.desc, callbacks[i])
@@ -1554,6 +2120,7 @@ function script_load(settings)
         obs.obs_data_array_release(save_array)
     end
     hotkey_zoom_id, hotkey_follow_id, hotkey_zoom_more_id, hotkey_zoom_less_id = ids[1], ids[2], ids[3], ids[4]
+    hotkey_calibrate_id = ids[5]
 
     read_settings(settings)
 
@@ -1585,6 +2152,7 @@ function script_unload()
         is_click_poll_running = false
         obs.timer_remove(on_click_poll)
     end
+    obs.timer_remove(on_calibrate_timer)
 
     if major > 29.0 then -- 29.0 seems to crash if you do this, so we ignore it as the script is closing anyway
         local transitions = obs.obs_frontend_get_transitions()
@@ -1600,6 +2168,7 @@ function script_unload()
         obs.obs_hotkey_unregister(on_toggle_follow)
         obs.obs_hotkey_unregister(on_zoom_more)
         obs.obs_hotkey_unregister(on_zoom_less)
+        obs.obs_hotkey_unregister(on_calibrate)
         obs.obs_frontend_remove_event_callback(on_frontend_event)
         release_sceneitem()
     end
@@ -1613,14 +2182,15 @@ end
 function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "zoom_value", 2)
     obs.obs_data_set_default_double(settings, "zoom_step", 0.5)
-    obs.obs_data_set_default_double(settings, "zoom_speed", 0.06)
+    obs.obs_data_set_default_double(settings, "zoom_speed", 0.05)
+    obs.obs_data_set_default_string(settings, "zoom_mode", "smooth")
     obs.obs_data_set_default_bool(settings, "click_zoom", false)
     obs.obs_data_set_default_double(settings, "auto_zoom_out_delay", 3)
     obs.obs_data_set_default_int(settings, "scale_filter", SCALE_LANCZOS)
     obs.obs_data_set_default_double(settings, "sharpen", 0.1)
     obs.obs_data_set_default_bool(settings, "follow", true)
     obs.obs_data_set_default_bool(settings, "follow_outside_bounds", false)
-    obs.obs_data_set_default_double(settings, "follow_speed", 0.25)
+    obs.obs_data_set_default_double(settings, "follow_speed", 0.18)
     obs.obs_data_set_default_int(settings, "follow_border", 8)
     obs.obs_data_set_default_int(settings, "follow_safezone_sensitivity", 4)
     obs.obs_data_set_default_bool(settings, "follow_auto_lock", false)
@@ -1638,7 +2208,7 @@ function script_defaults(settings)
 end
 
 function script_save(settings)
-    local ids = { hotkey_zoom_id, hotkey_follow_id, hotkey_zoom_more_id, hotkey_zoom_less_id }
+    local ids = { hotkey_zoom_id, hotkey_follow_id, hotkey_zoom_more_id, hotkey_zoom_less_id, hotkey_calibrate_id }
     for i, hk in ipairs(HOTKEYS) do
         if ids[i] ~= nil then
             local save_array = obs.obs_hotkey_save(ids[i])
@@ -1650,6 +2220,7 @@ end
 
 function script_update(settings)
     local old_source_name = source_name
+    local old_smooth = use_smooth
     local old_override = {
         use_monitor_override, monitor_override_x, monitor_override_y, monitor_override_w, monitor_override_h,
         monitor_override_sx, monitor_override_sy, monitor_override_dw, monitor_override_dh
@@ -1658,8 +2229,8 @@ function script_update(settings)
     source_name = obs.obs_data_get_string(settings, "source")
     read_settings(settings)
 
-    -- Only do the expensive refresh if the user selected a new source
-    if source_name ~= old_source_name then
+    -- Only do the expensive refresh if the user selected a new source or switched the zoom mode
+    if source_name ~= old_source_name or use_smooth ~= old_smooth then
         refresh_sceneitem(true)
     end
 
