@@ -360,6 +360,7 @@ python3 tests/mutate.py         # mutation test: cài lỗi vào script, test ph
 # Chạy trong OBS THẬT (Linux, headless): load toàn bộ script, chụp ảnh filter Cartoon Face
 sudo apt install obs-studio xvfb ffmpeg xdotool && pip install websocket-client
 python3 tests/e2e_obs.py ảnh_mặt.png out/
+python3 tests/demo_record.py out/   # quay video Zoom to Mouse: phím F9/F10/F11, di chuột, click — tất cả bằng xdotool
 ```
 
 `mutate.py` cài lại từng lỗi thật vào một bản sao script (gồm cả các lỗi của zoom-to-mouse v1.0.1 ở trên) và yêu cầu test phải **đỏ**. Mutant nào vẫn xanh nghĩa là test đang hở chỗ đó. Lượt đầu chạy có 14/42 mutant sống sót; viết thêm test cho tới khi bắt được hết thì lộ ra một lỗi thật (pomodoro trôi vài giây sau mỗi chục pha). Hiện tại 84/84 mutant đều bị bắt, kể cả mutant cài lại lỗi deadlock (mock mô phỏng luôn luật khóa của OBS) và các lỗi màn hình rời của v1.1.0.
