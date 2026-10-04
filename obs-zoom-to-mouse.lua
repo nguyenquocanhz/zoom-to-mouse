@@ -1756,6 +1756,8 @@ function on_timer()
                         locked_center = { x = zoom_target.clamped_center.x, y = zoom_target.clamped_center.y }
                         log("Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
                     end
+                end
+
                 if is_following_mouse or auto_zoom_out_delay > 0 then
                     -- Keep timer running for follow tracking or inactivity auto-zoom-out
                 else
