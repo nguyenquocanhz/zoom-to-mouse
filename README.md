@@ -89,6 +89,26 @@ Khi zoom 2× trên màn 1080p, OBS cắt một vùng 960×540 rồi **phóng nó
 5. **Đủ bitrate**: lúc khung chạy theo chuột, cả hình thay đổi liên tục. Bitrate thấp thì hình bị nhòe khi chuyển động. Ghi video nên dùng CQP/CRF khoảng 18–20; stream 1080p60 nên từ 6000 Kbps.
 6. Tăng font hệ thống / zoom IDE (Ctrl + `+`) trước khi quay. Đây vẫn là cách rẻ nhất để chữ nét.
 
+### Phiên bản v1.3.0 (Multi-Monitor & Stability Update)
+
+**Khắc phục lỗi Crash & Treo OBS (Deadlock & DEP)**
+- **Xóa bỏ triệt để Deadlock C-API:** Loại bỏ khóa đồ họa kép (`obs_enter_graphics` / `obs_leave_graphics`) trong hàm hủy view filter (OBS Core đã nắm giữ graphics lock, việc khóa lặp lại gây treo cứng `AppHangB1` khi đổi scene hoặc đóng OBS).
+- **Loại bỏ DEP Crash:** Thay thế cơ chế callback `ffi.cast("MONITORENUMPROC")` bằng Win32 API trực tiếp `EnumDisplayDevicesA` + `EnumDisplaySettingsA`, tránh hoàn toàn vi phạm vùng nhớ DEP (Data Execution Prevention / Access Violation) trên Windows x64.
+- **Khắc phục lỗi lệch tọa độ đa màn hình:** Sửa lỗi hàm `get_monitor_rects` chỉ lấy màn hình chính (0,0), dẫn đến chuột di sang màn hình phụ (ví dụ X:1920) bị tính sai tọa độ hoặc báo lỗi không nhận diện được màn hình.
+
+**Tính năng mới & Cải tiến**
+- **Chủ động chọn màn hình theo dõi (`Màn hình theo dõi` / `monitor_target`):**
+  - Dropdown trực tiếp trong cài đặt script: cho phép chủ động chọn ngay **Màn hình 1** (Chính 1920x1080 @ 0,0), **Màn hình 2** (Phụ 1920x1080 @ 1920,0), **Tự động nhận diện (Theo nguồn OBS)** hoặc **Tự chỉnh tọa độ thủ công**.
+  - Không cần vội vã rê chuột để đo màn hình trong 3 giây như bản cũ.
+- **Tự động thu nhỏ lại sau 5 giây không di chuột (`auto_zoom_out_delay = 5.0s`):**
+  - Khi đang zoom (kể cả zoom bằng phím tắt `Shift + Z`), nếu người dùng dừng rê chuột quá 5 giây, khung hình sẽ tự động zoom out mượt mà về lại toàn màn hình.
+- **Tắt mặc định tự zoom khi click chuột (`click_zoom = false`):**
+  - Tránh việc thao tác nhấp chuột làm việc bình thường vô tình kích hoạt phóng to ngoài ý muốn. Khuyến nghị bật/tắt chủ động bằng phím tắt `Shift + Z`.
+- **Chế độ Zoom Crop mặc định (Native C++):**
+  - Dùng filter `crop_filter` biên dịch native của OBS, an toàn đa luồng 100%, không xung đột giữa luồng render video và luồng UI LuaJIT.
+- **Vật lý lò xo giảm chấn (`smooth_damp`):**
+  - Chuyển động lia camera bám theo chuột êm ái, gia tốc và giảm tốc tự nhiên theo chuẩn thời gian thực độc lập tốc độ khung hình (frame rate independent).
+
 ### Những gì đã sửa/thêm so với v1.0.1
 
 **Sửa lỗi**
@@ -118,7 +138,7 @@ Khi zoom 2× trên màn 1080p, OBS cắt một vùng 960×540 rồi **phóng nó
 
 - **Linux Wayland**: không đọc được vị trí chuột của hệ thống. Hãy đăng nhập phiên X11 ("Ubuntu on Xorg").
 - macOS: lần đầu có thể cần cấp quyền *Accessibility / Input Monitoring* cho OBS thì auto zoom on click mới nhận click.
-- Nhiều màn hình: script đọc vị trí màn hình từ tên trong danh sách Display Capture. Nếu zoom bị lệch, bật **Set manual source position** và nhập X/Y/Width/Height của màn hình đó.
+- Nhiều màn hình: Giờ đây đã có menu chọn **Màn hình theo dõi** trực tiếp từ cài đặt script. Nếu cần chỉnh tùy biến có thể chọn *Tự chỉnh tọa độ thủ công*.
 
 ---
 
